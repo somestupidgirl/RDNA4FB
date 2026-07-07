@@ -58,6 +58,126 @@ bool RX9070XTFB::captureConsoleInfo() {
 }
 
 // ---------------------------------------------------------------------------
+// VBIOS acquisition and parsing
+// ---------------------------------------------------------------------------
+
+// Cap on how much ROM we are willing to copy. The full Navi 48 flash is 2 MiB;
+// the legacy image within it is ~58 KiB.
+static constexpr size_t kMaxVBIOSSize = 2 * 1024 * 1024;
+
+bool RX9070XTFB::copyVBIOSFromProperty() {
+	// OpenCore DeviceProperties (or WhateverGreen) can inject the VBIOS as
+	// ATY,bin_image on the GPU's PCI node. Preferred: no hardware access.
+	auto *rom = OSDynamicCast(OSData, pciDevice->getProperty("ATY,bin_image"));
+	if (!rom || rom->getLength() < 512 || rom->getLength() > kMaxVBIOSSize)
+		return false;
+
+	vbiosSize = rom->getLength();
+	vbiosData = static_cast<uint8_t *>(IOMalloc(vbiosSize));
+	if (!vbiosData) {
+		vbiosSize = 0;
+		return false;
+	}
+	memcpy(vbiosData, rom->getBytesNoCopy(), vbiosSize);
+	FBLOG("VBIOS: %zu bytes from ATY,bin_image", vbiosSize);
+	return true;
+}
+
+bool RX9070XTFB::copyVBIOSFromExpansionROM() {
+	// Size the expansion ROM BAR, then map and copy it with decode enabled.
+	uint32_t saved = pciDevice->configRead32(kIOPCIConfigExpansionROMBase);
+	pciDevice->configWrite32(kIOPCIConfigExpansionROMBase, 0xFFFFF800);
+	uint32_t sizing = pciDevice->configRead32(kIOPCIConfigExpansionROMBase);
+	pciDevice->configWrite32(kIOPCIConfigExpansionROMBase, saved);
+
+	uint32_t addr = saved & 0xFFFFF800;
+	size_t romLen = sizing ? static_cast<size_t>(~(sizing & 0xFFFFF800)) + 1 : 0;
+	if (!addr || !romLen || romLen > kMaxVBIOSSize) {
+		FBLOG("VBIOS: expansion ROM unavailable (bar=0x%08x size=%zu)", saved, romLen);
+		return false;
+	}
+
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(addr, romLen, kIODirectionIn);
+	if (!desc)
+		return false;
+
+	bool ok = false;
+	// Enable ROM decode only for the duration of the copy.
+	pciDevice->configWrite32(kIOPCIConfigExpansionROMBase, addr | 1);
+	auto *map = desc->map();
+	if (map) {
+		vbiosData = static_cast<uint8_t *>(IOMalloc(romLen));
+		if (vbiosData) {
+			memcpy(vbiosData, reinterpret_cast<const void *>(map->getVirtualAddress()), romLen);
+			vbiosSize = romLen;
+			ok = true;
+		}
+		map->release();
+	}
+	pciDevice->configWrite32(kIOPCIConfigExpansionROMBase, saved);
+	desc->release();
+
+	if (ok)
+		FBLOG("VBIOS: %zu bytes from expansion ROM at 0x%08x", vbiosSize, addr);
+	return ok;
+}
+
+void RX9070XTFB::freeVBIOS() {
+	if (vbiosData) {
+		IOFree(vbiosData, vbiosSize);
+		vbiosData = nullptr;
+		vbiosSize = 0;
+	}
+}
+
+void RX9070XTFB::publishVBIOSInfo() {
+	char name[64];
+	if (atomBios.configName(name, sizeof(name)))
+		setProperty("AtomBIOS,ImageName", name);
+
+	AtomBios::FirmwareInfo3 fw;
+	if (atomBios.getFirmwareInfo(fw)) {
+		setProperty("AtomBIOS,FirmwareRevision", fw.firmwareRevision, 32);
+		setProperty("AtomBIOS,FirmwareCapability", fw.firmwareCapability, 32);
+	}
+
+	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
+	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
+	if (n) {
+		// e.g. "DisplayPort,DisplayPort,HDMI-A,HDMI-A"
+		char list[128] {};
+		for (size_t i = 0; i < n; i++) {
+			if (i) strlcat(list, ",", sizeof(list));
+			strlcat(list, AtomBios::connectorName(AtomBios::connectorType(paths[i].connectorObjId)),
+			        sizeof(list));
+			FBLOG("connector %zu: %s objid=0x%04x encoder=0x%04x devtag=0x%04x", i,
+			      AtomBios::connectorName(AtomBios::connectorType(paths[i].connectorObjId)),
+			      paths[i].connectorObjId, paths[i].encoderObjId, paths[i].deviceTag);
+		}
+		setProperty("AtomBIOS,Connectors", list);
+		setProperty("AtomBIOS,ConnectorCount", static_cast<uint64_t>(n), 32);
+	}
+}
+
+bool RX9070XTFB::loadVBIOS() {
+	if (!copyVBIOSFromProperty() && !copyVBIOSFromExpansionROM()) {
+		FBLOG("VBIOS: no image available (inject ATY,bin_image via DeviceProperties)");
+		return false;
+	}
+
+	if (!atomBios.init(vbiosData, vbiosSize)) {
+		FBLOG("VBIOS: image failed AtomBIOS validation");
+		freeVBIOS();
+		return false;
+	}
+
+	FBLOG("VBIOS: valid AtomBIOS image at +0x%zx, %zu bytes",
+	      atomBios.imageOffset(), atomBios.imageLength());
+	publishVBIOSInfo();
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // IOService
 // ---------------------------------------------------------------------------
 
@@ -101,6 +221,10 @@ bool RX9070XTFB::start(IOService *provider) {
 	// mastering — we never issue DMA.
 	pciDevice->setMemoryEnable(true);
 
+	// Best effort: connector layout and firmware info for later native
+	// mode-setting work. The framebuffer itself does not depend on this.
+	loadVBIOS();
+
 	if (!super::start(provider)) {
 		FBLOG("start: super::start failed");
 		return false;
@@ -112,6 +236,7 @@ bool RX9070XTFB::start(IOService *provider) {
 
 void RX9070XTFB::stop(IOService *provider) {
 	FBLOG("stop");
+	freeVBIOS();
 	super::stop(provider);
 }
 

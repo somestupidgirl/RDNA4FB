@@ -1,0 +1,139 @@
+//
+//  AtomBios.hpp
+//  RX9070XT
+//
+//  Minimal, bounds-checked AtomBIOS (atomfirmware-era) parser for the data
+//  tables needed to eventually drive Navi 48's DCN display engine.
+//
+//  Deliberately freestanding: no IOKit, no libkern, no allocation — it only
+//  reads from a caller-provided buffer. The same code compiles in the kext
+//  and in the host-side `atomdump` tool, which `make test` runs against the
+//  real ROM in firmware/ so the parsing logic is verified without hardware.
+//
+//  Layout facts below were validated byte-for-byte against
+//  firmware/Sapphire.RX9070XT.16384.241213.rom (Navi 48, ATOM header rev 2.3,
+//  master data table v2.1 with 35 entries) and cross-checked with Linux
+//  drivers/gpu/drm/amd/include/atomfirmware.h.
+//
+
+#ifndef AtomBios_hpp
+#define AtomBios_hpp
+
+#include <stdint.h>
+#include <stddef.h>
+
+class AtomBios {
+public:
+	// Indices into the v2.1 master list of data tables (atomfirmware.h).
+	enum DataTable : uint32_t {
+		UtilityPipeline      = 0,
+		MultimediaInfo       = 1,
+		SmcDpmInfo           = 2,
+		FirmwareInfo         = 4,
+		LcdInfo              = 6,
+		SmuInfo              = 8,
+		VramUsageByFirmware  = 11,
+		GpioPinLut           = 12,
+		GfxInfo              = 14,
+		PowerPlayInfo        = 15,
+		DisplayObjectInfo    = 22,
+		IndirectIoAccess     = 23,
+		UmcInfo              = 24,
+		DceInfo              = 26,
+		VramInfo             = 27,
+		VoltageObjectInfo    = 31,
+		MaxDataTable         = 35,
+	};
+
+	// atom_common_table_header
+	struct TableHeader {
+		uint16_t size;
+		uint8_t  formatRev;
+		uint8_t  contentRev;
+	};
+
+	// Subset of atom_firmware_info_v3_x shared by v3.1..v3.5. Bootup clocks
+	// may legitimately be 0 on SMU-managed boards (they are on this ROM).
+	struct FirmwareInfo3 {
+		TableHeader header;
+		uint32_t firmwareRevision;
+		uint32_t bootupSclk10KHz;
+		uint32_t bootupMclk10KHz;
+		uint32_t firmwareCapability;
+	};
+
+	// One display path from display_object_info_table_v1_5.
+	// atom_display_object_path_v3 is 16 bytes:
+	//   u16 display_objid, u16 disp_recordoffset, u16 encoderobjid,
+	//   u16 reserved[3], u16 device_tag, u16 reserved
+	struct DisplayPath {
+		uint16_t connectorObjId;
+		uint16_t recordOffset;
+		uint16_t encoderObjId;
+		uint16_t deviceTag;
+	};
+
+	enum ConnectorType : uint8_t {
+		ConnectorUnknown = 0,
+		ConnectorDP,        // object id low byte 0x13
+		ConnectorHDMIA,     // object id low byte 0x0c
+		ConnectorDVID,      // 0x02 / 0x04
+		ConnectorVGA,       // 0x05
+		ConnectorUSBC,      // 0x17
+	};
+
+	static constexpr size_t MaxDisplayPaths = 8;
+
+	// Locate and validate a VBIOS image inside `romData`. Handles both a raw
+	// legacy image (0x55AA at offset 0) and AMD's unified PSP-wrapped ROM
+	// (this card: 2 MiB file, image at 0x40000 with backup at 0x120000).
+	// Returns false if no image with a valid ATOM signature+checksum exists.
+	bool init(const uint8_t *romData, size_t romSize);
+
+	bool isValid() const { return valid; }
+
+	// Offset of the VBIOS image within the buffer passed to init().
+	size_t   imageOffset() const { return base; }
+	// Image length from the 512-byte-block count at image offset 2.
+	size_t   imageLength() const { return length; }
+
+	uint16_t subsystemVendorId() const { return subsysVid; }
+	uint16_t subsystemId()       const { return subsysId; }
+
+	// NUL-terminated config-file name (e.g. "NAVI48.bin"); returns bytes
+	// copied (0 on failure). Trailing spaces are trimmed.
+	size_t configName(char *out, size_t outLen) const;
+
+	// Absolute offset (within the init() buffer) of a data table, or 0 if
+	// the table is absent. `header` receives the table header when present.
+	size_t dataTable(DataTable table, TableHeader *header = nullptr) const;
+
+	bool getFirmwareInfo(FirmwareInfo3 &out) const;
+
+	// Fills `paths` (up to maxPaths) from displayobjectinfo v1.5; returns the
+	// number of display paths, or 0 when the table is absent/unsupported.
+	size_t getDisplayPaths(DisplayPath *paths, size_t maxPaths) const;
+
+	static ConnectorType connectorType(uint16_t connectorObjId);
+	static const char   *connectorName(ConnectorType type);
+
+private:
+	const uint8_t *data { nullptr };
+	size_t size   { 0 };
+	size_t base   { 0 };      // VBIOS image offset in data
+	size_t length { 0 };      // VBIOS image length
+	size_t masterDataTable { 0 };  // absolute offset of master data table
+	uint16_t subsysVid { 0 };
+	uint16_t subsysId  { 0 };
+	bool valid { false };
+
+	bool validateImage(size_t offset);
+	bool readTableHeader(size_t absOffset, TableHeader &out) const;
+
+	// Bounds-checked little-endian readers (absolute offsets).
+	bool readU8 (size_t off, uint8_t  &v) const;
+	bool readU16(size_t off, uint16_t &v) const;
+	bool readU32(size_t off, uint32_t &v) const;
+};
+
+#endif /* AtomBios_hpp */

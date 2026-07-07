@@ -24,6 +24,8 @@
 #include <IOKit/IOPlatformExpert.h>
 #include <pexpert/pexpert.h>
 
+#include "AtomBios.hpp"
+
 // Single, driver-defined display mode id. Must be in 0x1..0x7fffffff.
 #define kRX9070XTDisplayModeID  ((IODisplayModeID)1)
 
@@ -43,7 +45,19 @@ class RX9070XTFB : public IOFramebuffer {
 	uint32_t            fbRowBytes { 0 };
 	uint32_t            fbDepth    { 32 };
 
+	// VBIOS image (owned copy) and its parsed view. Populated by loadVBIOS();
+	// absence is non-fatal — the framebuffer works without it, but connector
+	// knowledge is needed for future native mode setting.
+	uint8_t  *vbiosData { nullptr };
+	size_t    vbiosSize { 0 };
+	AtomBios  atomBios;
+
 	bool captureConsoleInfo();
+	bool loadVBIOS();
+	bool copyVBIOSFromProperty();
+	bool copyVBIOSFromExpansionROM();
+	void publishVBIOSInfo();
+	void freeVBIOS();
 
 public:
 	// IOService

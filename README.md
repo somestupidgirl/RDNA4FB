@@ -34,8 +34,10 @@ add real hardware bring-up later (see Roadmap).
 | File | Purpose |
 |------|---------|
 | `Source/RX9070XTFB.{hpp,cpp}` | The `IOFramebuffer` subclass (the part that reaches the desktop). |
+| `Source/AtomBios.{hpp,cpp}` | Freestanding, bounds-checked AtomBIOS data-table parser (groundwork for native mode setting). |
 | `Source/kern_start.cpp` | Lilu plugin entry (`PluginConfiguration`, `pluginStart`). |
 | `Source/kmod_info.c` | Hand-written kmod glue (Xcode normally generates this). |
+| `tools/atomdump.cpp` | Host harness: runs the kext's parser against the real ROM (`make test`). |
 | `Info.plist` | Two personalities: Lilu plugin + PCI framebuffer match. |
 | `Makefile` | Cross-compiles x86_64 on any host, assembles the `.kext`. |
 
@@ -43,6 +45,8 @@ add real hardware bring-up later (see Roadmap).
 
 ```sh
 make            # -> build/RX9070XT.kext  (x86_64, min macOS 11)
+make test       # build host-side atomdump, verify the AtomBIOS parser
+                # against firmware/Sapphire.RX9070XT.16384.241213.rom
 make clean
 ```
 
@@ -81,10 +85,15 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
 
 1. **Confirm scanout adoption** — get the desktop up on the GOP buffer (this
    kext). Validate stride/format against what you actually see.
-2. **Mode setting** — parse the AtomBIOS command tables (`atombios.h`,
-   `atomfirmware.h` in amdgpu) and drive **DCN 4.0.1** (Navi 48's display
-   controller) to change resolution / light up other connectors. This is where
-   `enableController()` stops being a no-op.
+2. **Mode setting** — parse the AtomBIOS tables (`atomfirmware.h` in amdgpu)
+   and drive **DCN 4.0.1** (Navi 48's display controller) to change resolution
+   / light up other connectors. This is where `enableController()` stops being
+   a no-op. *Started:* `AtomBios.{hpp,cpp}` parses the ROM header, master data
+   table v2.1, firmwareinfo v3.5 and displayobjectinfo v1.5 — verified against
+   this card's ROM (`make test`), which reports 2× DisplayPort + 2× HDMI-A.
+   At runtime the kext obtains the VBIOS from an injected `ATY,bin_image`
+   device property (preferred) or the PCI expansion ROM, and publishes
+   `AtomBIOS,*` properties on the framebuffer node.
 3. **Multiple connectors & EDID** — read EDID over DP/HDMI AUX, publish real
    timings from `getInformationForDisplayMode`.
 4. **Power / clocks** — SMU firmware handshake (see `../firmware` power tables)
@@ -99,6 +108,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
 - [x] Cross-compiles on Apple Silicon → x86_64 kext bundle
 - [x] Lilu plugin bootstrap + PCI framebuffer personality
 - [x] Adopts firmware/GOP linear framebuffer, one fixed 32bpp mode
+- [x] AtomBIOS parser (rom header, master data table, firmwareinfo,
+      display paths) verified against the real ROM via `make test`
+- [x] Runtime VBIOS acquisition (`ATY,bin_image` property / expansion ROM)
 - [ ] Verified booting to desktop on real RX 9070 XT hardware
 - [ ] Native mode setting (DCN 4.0.1)
 - [ ] Acceleration / Metal
