@@ -14,6 +14,7 @@
 //
 
 #include "../Source/AtomBios.hpp"
+#include "../Source/IpDiscovery.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -130,6 +131,53 @@ int main(int argc, char **argv) {
 			       pins[i].gpioId, pins[i].regIndex, pins[i].shift, pins[i].maskShift);
 	} else {
 		fprintf(stderr, "FAIL: gpio pin lut not parsed\n");
+		failures++;
+	}
+
+	IpDiscovery disc;
+	if (disc.init(rom.data(), rom.size())) {
+		printf("\nip discovery binary at 0x%zx, %u IPs on die 0:\n",
+		       disc.binaryOffset(), disc.ipCount());
+		static const struct { uint16_t id; const char *name; } wanted[] = {
+			{ IpDiscovery::HwGc, "GC (gfx)" }, { IpDiscovery::HwDmu, "DMU (DCN)" },
+			{ IpDiscovery::HwNbif, "NBIF" },   { IpDiscovery::HwMp0, "MP0 (PSP)" },
+			{ IpDiscovery::HwMmhub, "MMHUB" }, { IpDiscovery::HwSdma0, "SDMA0" },
+		};
+		for (auto &w : wanted) {
+			IpDiscovery::IpEntry ip;
+			if (disc.findIp(w.id, 0, ip)) {
+				printf("  %-9s v%u.%u.%u  bases:", w.name, ip.major, ip.minor, ip.revision);
+				for (uint8_t b = 0; b < ip.numBases; b++)
+					printf(" 0x%08x", ip.bases[b]);
+				printf("\n");
+			} else {
+				fprintf(stderr, "FAIL: IP hw_id %u missing from discovery\n", w.id);
+				failures++;
+			}
+		}
+
+		// The register this maps is the kext's first MMIO smoke-test read:
+		// RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE (NBIF seg 2, dword 0x00c3) —
+		// VRAM size in MiB, expected 16384 on this card.
+		uint32_t memsize;
+		if (disc.regByteOffset(IpDiscovery::HwNbif, 0, 2, 0x00c3, memsize)) {
+			printf("  RCC_CONFIG_MEMSIZE MMIO byte offset: 0x%x\n", memsize);
+			if (memsize != 0x378c) {
+				fprintf(stderr, "FAIL: unexpected RCC_CONFIG_MEMSIZE offset\n");
+				failures++;
+			}
+		} else {
+			fprintf(stderr, "FAIL: cannot derive RCC_CONFIG_MEMSIZE offset\n");
+			failures++;
+		}
+
+		IpDiscovery::IpEntry gc;
+		if (disc.findIp(IpDiscovery::HwGc, 0, gc) && gc.major != 12) {
+			fprintf(stderr, "FAIL: GC major %u, expected 12 (RDNA4)\n", gc.major);
+			failures++;
+		}
+	} else {
+		fprintf(stderr, "FAIL: no IP discovery binary found\n");
 		failures++;
 	}
 

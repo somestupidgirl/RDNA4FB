@@ -35,6 +35,7 @@ add real hardware bring-up later (see Roadmap).
 |------|---------|
 | `Source/RX9070XTFB.{hpp,cpp}` | The `IOFramebuffer` subclass (the part that reaches the desktop). |
 | `Source/AtomBios.{hpp,cpp}` | Freestanding, bounds-checked AtomBIOS data-table parser (groundwork for native mode setting). |
+| `Source/IpDiscovery.{hpp,cpp}` | Parser for AMD's IP discovery binary — per-card IP versions and register segment bases (what amdgpu uses instead of hardcoded offsets). |
 | `Source/kern_start.cpp` | Lilu plugin entry (`PluginConfiguration`, `pluginStart`). |
 | `Source/kmod_info.c` | Hand-written kmod glue (Xcode normally generates this). |
 | `tools/atomdump.cpp` | Host harness: runs the kext's parser against the real ROM (`make test`). |
@@ -65,6 +66,11 @@ file build/RX9070XT.kext/Contents/MacOS/RX9070XT   # Mach-O 64-bit kext bundle x
 1. Put `Lilu.kext` **and** `RX9070XT.kext` in `EFI/OC/Kexts`, add both to your
    OpenCore `config.plist` `Kernel > Add` (Lilu first — it must load before its
    plugins).
+   Also inject the **full 2 MiB flash dump** (the `.rom` in `firmware/`) as
+   `ATY,bin_image` under the GPU's PciRoot path in `DeviceProperties` — the
+   IP discovery binary lives in the PSP region of the flash, which the PCI
+   expansion ROM does not expose, so register-base derivation only works with
+   the full dump.
 2. Recommended while bringing this up:
    - `-v keepsyms=1` to see panics.
    - `-rx9070xtdbg` to enable this plugin's debug logging, `-liludbgall` for
@@ -119,6 +125,10 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
 - [x] Per-connector DDC/AUX line + HPD pin mapping (path records +
       gpio_pin_lut), published as `AtomBIOS,Connectors`
 - [x] Adopted console geometry published as `Console,*` registry properties
+- [x] IP discovery parser: GC v12.0.1 / DCN v4.1.0 / NBIF v6.3.1 register
+      segment bases extracted from the ROM (`make test` gates on them)
+- [x] BAR5 register MMIO mapping + smoke-test read (RCC_CONFIG_MEMSIZE →
+      `VRAM,TotalMB` / `MMIO,Verified` properties; needs hardware to confirm)
 - [ ] Verified booting to desktop on real RX 9070 XT hardware
 - [ ] Native mode setting (DCN 4.0.1)
 - [ ] Acceleration / Metal

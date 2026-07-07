@@ -25,6 +25,7 @@
 #include <pexpert/pexpert.h>
 
 #include "AtomBios.hpp"
+#include "IpDiscovery.hpp"
 
 // Single, driver-defined display mode id. Must be in 0x1..0x7fffffff.
 #define kRX9070XTDisplayModeID  ((IODisplayModeID)1)
@@ -52,12 +53,30 @@ class RX9070XTFB : public IOFramebuffer {
 	size_t    vbiosSize { 0 };
 	AtomBios  atomBios;
 
+	// Register bases from the IP discovery binary (present when the full
+	// 2 MiB flash dump is injected as ATY,bin_image; the PSP region holding
+	// it is not visible through the expansion ROM).
+	IpDiscovery ipDiscovery;
+
+	// Register MMIO aperture (PCI BAR5). Mapped read-only usage for now:
+	// the only access is the RCC_CONFIG_MEMSIZE smoke-test read.
+	IOMemoryMap       *rmmioMap { nullptr };
+	volatile uint32_t *rmmio    { nullptr };
+	size_t             rmmioSize { 0 };
+
 	bool captureConsoleInfo();
 	bool loadVBIOS();
 	bool copyVBIOSFromProperty();
 	bool copyVBIOSFromExpansionROM();
 	void publishVBIOSInfo();
 	void freeVBIOS();
+
+	bool mapRegisters();
+	void unmapRegisters();
+	// Bounds-checked 32-bit MMIO read; returns 0xFFFFFFFF (all-ones, the PCIe
+	// master-abort pattern) when unmapped or out of range.
+	uint32_t regRead32(uint32_t byteOffset) const;
+	void probeMemSize();
 
 public:
 	// IOService

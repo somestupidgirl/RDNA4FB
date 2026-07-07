@@ -190,7 +190,94 @@ bool RX9070XTFB::loadVBIOS() {
 	FBLOG("VBIOS: valid AtomBIOS image at +0x%zx, %zu bytes",
 	      atomBios.imageOffset(), atomBios.imageLength());
 	publishVBIOSInfo();
+
+	// IP discovery only exists in a full flash dump; a bare legacy VBIOS
+	// (typical expansion ROM contents) won't have it. Non-fatal.
+	if (ipDiscovery.init(vbiosData, vbiosSize)) {
+		FBLOG("discovery: binary at +0x%zx, %u IPs", ipDiscovery.binaryOffset(),
+		      ipDiscovery.ipCount());
+		IpDiscovery::IpEntry gc, dmu;
+		if (ipDiscovery.findIp(IpDiscovery::HwGc, 0, gc)) {
+			char ver[16];
+			snprintf(ver, sizeof(ver), "%u.%u.%u", gc.major, gc.minor, gc.revision);
+			setProperty("Discovery,GCVersion", ver);
+		}
+		if (ipDiscovery.findIp(IpDiscovery::HwDmu, 0, dmu)) {
+			char ver[16];
+			snprintf(ver, sizeof(ver), "%u.%u.%u", dmu.major, dmu.minor, dmu.revision);
+			setProperty("Discovery,DCNVersion", ver);
+		}
+	} else {
+		FBLOG("discovery: not present in image (inject the full 2MiB flash dump to enable)");
+	}
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Register MMIO (BAR5)
+// ---------------------------------------------------------------------------
+
+bool RX9070XTFB::mapRegisters() {
+	// On AMD dGPUs since Bonaire the register aperture is BAR5 (BAR0/1 is the
+	// VRAM aperture, BAR2/3 doorbells) — amdgpu_device.c does the same.
+	IODeviceMemory *bar = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
+	if (!bar) {
+		FBLOG("mmio: BAR5 not present/assigned");
+		return false;
+	}
+
+	rmmioMap = bar->map();
+	if (!rmmioMap) {
+		FBLOG("mmio: failed to map BAR5");
+		return false;
+	}
+
+	rmmio = reinterpret_cast<volatile uint32_t *>(rmmioMap->getVirtualAddress());
+	rmmioSize = rmmioMap->getLength();
+	FBLOG("mmio: BAR5 mapped, %zu KiB", rmmioSize / 1024);
+	return true;
+}
+
+void RX9070XTFB::unmapRegisters() {
+	rmmio = nullptr;
+	rmmioSize = 0;
+	if (rmmioMap) {
+		rmmioMap->release();
+		rmmioMap = nullptr;
+	}
+}
+
+uint32_t RX9070XTFB::regRead32(uint32_t byteOffset) const {
+	if (!rmmio || byteOffset + 4 > rmmioSize)
+		return 0xFFFFFFFF;
+	return rmmio[byteOffset / 4];
+}
+
+void RX9070XTFB::probeMemSize() {
+	// RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE (NBIF 6.3.1 seg 2, dword 0x00c3):
+	// VRAM size in MiB — amdgpu's nbif_v6_3_1_get_memsize. The byte offset
+	// below was derived from this card's IP discovery table (base 0xd20)
+	// and is used as the fallback when discovery isn't available at runtime.
+	uint32_t off = 0x378c;
+	uint32_t discOff;
+	if (ipDiscovery.isValid() &&
+	    ipDiscovery.regByteOffset(IpDiscovery::HwNbif, 0, 2, 0x00c3, discOff)) {
+		if (discOff != off)
+			FBLOG("mmio: discovery moved RCC_CONFIG_MEMSIZE to 0x%x", discOff);
+		off = discOff;
+	}
+
+	uint32_t memsizeMB = regRead32(off);
+	if (memsizeMB == 0 || memsizeMB == 0xFFFFFFFF) {
+		FBLOG("mmio: RCC_CONFIG_MEMSIZE read failed (0x%08x) — MMIO not usable", memsizeMB);
+		return;
+	}
+
+	FBLOG("mmio: VRAM size %u MiB (RCC_CONFIG_MEMSIZE @ 0x%x)", memsizeMB, off);
+	setProperty("VRAM,TotalMB", static_cast<uint64_t>(memsizeMB), 32);
+	// Independent confirmation that register MMIO works — the gate for all
+	// future DCN (AUX/EDID, mode setting) work.
+	setProperty("MMIO,Verified", memsizeMB == 16384);
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +328,10 @@ bool RX9070XTFB::start(IOService *provider) {
 	// mode-setting work. The framebuffer itself does not depend on this.
 	loadVBIOS();
 
+	// Best effort: prove register MMIO works with one safe read (VRAM size).
+	if (mapRegisters())
+		probeMemSize();
+
 	if (!super::start(provider)) {
 		FBLOG("start: super::start failed");
 		return false;
@@ -252,6 +343,7 @@ bool RX9070XTFB::start(IOService *provider) {
 
 void RX9070XTFB::stop(IOService *provider) {
 	FBLOG("stop");
+	unmapRegisters();
 	freeVBIOS();
 	super::stop(provider);
 }
