@@ -273,20 +273,39 @@ void RX9070XTFB::dumpDCN() {
 	// we will widen to pipes 1-3.
 	struct Reg { const char *name; uint8_t base; uint32_t off; };
 	static const Reg regs[] = {
-		{ "OTG0_OTG_CONTROL",          2, 0x1b43 }, // is pipe 0 the active timing gen?
-		{ "CNVC0_SURFACE_PIXEL_FORMAT",2, 0x0ccf }, // DPP byte->component decode (rotation suspect #1)
-		{ "HUBP0_DCSURF_SURFACE_CONFIG",2, 0x05e5 },
-		{ "MPCC0_MPCC_CONTROL",        3, 0x0003 },
-		{ "MPC_OUT0_CSC_MODE",         3, 0x030b }, // output CSC enable (rotation suspect #2)
-		{ "MPC_OUT0_CSC_C11_C12_A",    3, 0x030c }, // CSC matrix rows — a permutation shows here
-		{ "MPC_OUT0_CSC_C13_C14_A",    3, 0x030d },
-		{ "MPC_OUT0_CSC_C21_C22_A",    3, 0x030e },
-		{ "MPC_OUT0_CSC_C23_C24_A",    3, 0x030f },
-		{ "MPC_OUT0_CSC_C31_C32_A",    3, 0x0310 },
-		{ "MPC_OUT0_CSC_C33_C34_A",    3, 0x0311 }, // C34 = blue/output offset (blue-cast suspect)
-		{ "FMT0_FMT_CONTROL",          2, 0x1840 }, // pixel encoding / dither
-		{ "FMT0_FMT_DYNAMIC_EXP_CNTL", 2, 0x183f }, // RGB range (limited/full) — blue-cast suspect
-		{ "OPP_PIPE0_OPP_PIPE_CONTROL",2, 0x188c },
+		// Surface format + fixed-point conversion bias/scale (blue-floor suspect).
+		{ "CNVC0_SURFACE_PIXEL_FORMAT",2, 0x0ccf },
+		{ "CNVC0_FORMAT_CONTROL",      2, 0x0cd0 },
+		{ "CNVC0_FCNV_FP_BIAS_R",      2, 0x0cd1 },
+		{ "CNVC0_FCNV_FP_BIAS_G",      2, 0x0cd2 },
+		{ "CNVC0_FCNV_FP_BIAS_B",      2, 0x0cd3 },
+		{ "CNVC0_FCNV_FP_SCALE_R",     2, 0x0cd4 },
+		{ "CNVC0_FCNV_FP_SCALE_G",     2, 0x0cd5 },
+		{ "CNVC0_FCNV_FP_SCALE_B",     2, 0x0cd6 },
+		// Per-pipe input CSC — a (G,B,R) permutation matrix would appear here.
+		{ "CNVC0_PRE_CSC_MODE",        2, 0x0cdf },
+		{ "CNVC0_PRE_CSC_C11_C12",     2, 0x0ce0 },
+		{ "CNVC0_PRE_CSC_C13_C14",     2, 0x0ce1 },
+		{ "CNVC0_PRE_CSC_C21_C22",     2, 0x0ce2 },
+		{ "CNVC0_PRE_CSC_C23_C24",     2, 0x0ce3 },
+		{ "CNVC0_PRE_CSC_C31_C32",     2, 0x0ce4 },
+		{ "CNVC0_PRE_CSC_C33_C34",     2, 0x0ce5 }, // C34 = offset term (blue floor)
+		// Post-blend CSC — the other place a permutation + offset could live.
+		{ "CM0_CM_CONTROL",            2, 0x0d67 },
+		{ "CM0_CM_POST_CSC_CONTROL",   2, 0x0d68 },
+		{ "CM0_CM_POST_CSC_C11_C12",   2, 0x0d69 },
+		{ "CM0_CM_POST_CSC_C13_C14",   2, 0x0d6a },
+		{ "CM0_CM_POST_CSC_C21_C22",   2, 0x0d6b },
+		{ "CM0_CM_POST_CSC_C23_C24",   2, 0x0d6c },
+		{ "CM0_CM_POST_CSC_C31_C32",   2, 0x0d6d },
+		{ "CM0_CM_POST_CSC_C33_C34",   2, 0x0d6e },
+		{ "CM0_CM_BIAS_CR_R",          2, 0x0d75 },
+		{ "CM0_CM_BIAS_Y_G_CB_B",      2, 0x0d76 },
+		{ "CM0_CM_GAMCOR_CONTROL",     2, 0x0d77 }, // output gamma mode (inversion/tint suspect)
+		{ "CM0_CM_COEF_FORMAT",        2, 0x0dc6 },
+		// Kept for context.
+		{ "OTG0_OTG_CONTROL",          2, 0x1b43 },
+		{ "MPC_OUT0_CSC_MODE",         3, 0x030b },
 	};
 
 	FBLOG("dcn: register dump (DMU bases seg2/seg3, read-only) ---");
