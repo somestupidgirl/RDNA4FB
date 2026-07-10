@@ -299,7 +299,34 @@ void RX9070XTFB::dumpDCN() {
 	FBLOG("dcn:   DP0_DP_SEC_CNTL2 = 0x%08x", regReadDmu(2, 0x2169));
 	FBLOG("dcn:   DP0_DP_SEC_CNTL7 = 0x%08x", regReadDmu(2, 0x216e));
 	FBLOG("dcn:   DP0_DP_MSA_VBID_MISC = 0x%08x", regReadDmu(2, 0x2170));
+
+	// MPC MCM blocks (shaper -> 3DLUT -> 1DLUT), the post-CSC colour stages
+	// not covered by earlier dumps. An enabled 3DLUT with unloaded RAM would
+	// produce exactly the observed spatially-perfect arbitrary recolouring.
+	static const uint32_t mcm[4][3] = {  // {SHAPER_CONTROL, 3DLUT_MODE, 1DLUT_CONTROL}, base 3
+		{ 0x0453, 0x048a, 0x0493 },
+		{ 0x0503, 0x053a, 0x0543 },
+		{ 0x05b3, 0x05ea, 0x05f3 },
+		{ 0x0663, 0x069a, 0x06a3 },
+	};
+	for (int i = 0; i < 4; i++)
+		FBLOG("dcn:   MCM%d shaper=0x%08x 3dlut_mode=0x%08x 1dlut=0x%08x",
+		      i, regReadDmu(3, mcm[i][0]), regReadDmu(3, mcm[i][1]),
+		      regReadDmu(3, mcm[i][2]));
 	FBLOG("dcn: --- end register dump ---");
+
+	// Boot-arg "rx9070xt-lutbypass=1": force all MCM stages to bypass.
+	// Bypass is the hardware's pass-through state, so this cannot make the
+	// image worse than a wrong LUT; a reboot restores firmware state.
+	uint32_t fix = 0;
+	if (PE_parse_boot_argn("rx9070xt-lutbypass", &fix, sizeof(fix)) && fix != 0) {
+		for (int i = 0; i < 4; i++) {
+			regWriteDmu(3, mcm[i][0], 0);  // shaper: bypass
+			regWriteDmu(3, mcm[i][1], 0);  // 3DLUT: bypass
+			regWriteDmu(3, mcm[i][2], 0);  // 1DLUT: bypass
+		}
+		FBLOG("dcn: MCM shaper/3DLUT/1DLUT forced to bypass on all pipes");
+	}
 }
 
 bool RX9070XTFB::regWriteDmu(uint8_t baseIdx, uint32_t dwordOffset, uint32_t value) {
