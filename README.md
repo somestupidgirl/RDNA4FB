@@ -4,6 +4,12 @@ A **non-accelerated framebuffer driver** for the AMD Radeon **RX 9070 XT**
 (Navi 48 / RDNA 4, PCI `0x1002:0x7550`) on x86_64 Hackintosh, built as a
 standalone IOKit kext against MacKernelSDK. Cross-compiles on Apple Silicon.
 
+**Status: working.** Verified on real hardware (Ryzen 9 5950X, Big Sur
+11.7.10): boots to a 4K desktop with correct colors, WindowServer composites
+on this framebuffer, and BAR5 register MMIO (read *and* write) is proven.
+Known v0 limitations: software cursor lags under load, display sleep is not
+implemented, and only the boot display lights up (single adopted scanout).
+
 > **Why not a Lilu plugin / OpenCore injection?** An `IOFramebuffer` subclass
 > must link against `com.apple.iokit.IOGraphicsFamily`, which on Big Sur+
 > lives in the *System* kernel collection — OpenCore can only inject into the
@@ -31,13 +37,33 @@ up. `RX9070XTFB` is an `IOFramebuffer` subclass that:
 
 1. Matches the RX 9070 XT PCI device (`IOPCIPrimaryMatch 0x75501002`).
 2. Reads the console framebuffer geometry in `start()` / `enableController()`.
+   **Hard-won detail:** `v_baseAddr` carries flag bits in its low bits (this
+   machine reads `0x840000001`); they must be masked off. Passing the raw
+   value shifts WindowServer's writes one byte from the true scanout base,
+   which recolours every pixel (R'=G, G'=B, B'=previous pixel's alpha) — it
+   presents as "inverted colors with a blue cast" and cost a week of DCN
+   register archaeology to trace. The hardware was configured correctly the
+   whole time.
 3. Exposes exactly **one** 32bpp display mode at that geometry.
 4. Returns that physical range from `getApertureRange()` so IOGraphics maps it
-   for scanout. No registers are programmed; no DMA is issued.
+   for scanout. Scanout/link registers are never reprogrammed; no DMA is
+   issued. BAR5 MMIO is used for read-mostly diagnostics (see boot-args).
 
-`kern_start.cpp` is the Lilu plugin half — it logs, reports whether the card is
-present, and provides a `onPatcherLoadForce` hook that is the natural place to
-add real hardware bring-up later (see Roadmap).
+At startup the kext also parses the VBIOS (AtomBIOS tables + AMD IP discovery
+binary) and publishes the results as registry properties (`AtomBIOS,*`,
+`Discovery,*`, `Console,*`, `VRAM,TotalMB`, `MMIO,Verified`) so the state of
+every bring-up layer is visible in `ioreg` without kernel logs.
+
+## Boot arguments
+
+All parsed without a leading dash (`name=1`, not `-name=1`):
+
+| Boot-arg | Effect |
+|----------|--------|
+| `rx9070xt-off=1` | Kill switch: `probe()` declines to match, restoring the macOS fallback framebuffer. Recovers from a bad build via OpenCore boot-args alone — no Safe Mode or filesystem surgery. |
+| `rx9070xt-cmap=N` | Diagnostic: permute the advertised R/G/B component masks (0–5). Note: WindowServer ignores these for 32-bit modes; kept for documentation of that finding. |
+| `rx9070xt-lutbypass=1` | Force the MPC MCM stages (shaper/3D LUT/1D LUT) to bypass on all pipes. |
+| `rx9070xt-8bpc=1` | Experiment: switch the active DP stream 10 bpc → 8 bpc and update the MSA to match (first proven live register write). |
 
 ## Files
 
@@ -60,10 +86,6 @@ make test       # build host-side atomdump, verify the AtomBIOS parser
 make clean
 ```
 
-The kext links against Lilu at **load** time via `OSBundleLibraries`; Lilu's
-symbols are intentionally left undefined in the `-kext` bundle and resolved by
-the kernel loader. You do **not** need a prebuilt `Lilu.kext` to compile.
-
 Verify the output:
 
 ```sh
@@ -73,10 +95,12 @@ file build/RX9070XT.kext/Contents/MacOS/RX9070XT   # Mach-O 64-bit kext bundle x
 ## Installing (on the Intel target)
 
 1. **Do not add RX9070XT.kext to OpenCore `Kernel → Add`** — injection cannot
-   work (see box above). Instead, on the running system:
+   work (see box above). Instead, on the running system (same commands to
+   update an existing install; remove the old bundle first):
 
    ```sh
-   sudo cp -R RX9070XT.kext /Library/Extensions/
+   sudo rm -rf /Library/Extensions/RX9070XT.kext
+   sudo cp -R build/RX9070XT.kext /Library/Extensions/
    sudo chown -R root:wheel /Library/Extensions/RX9070XT.kext
    sudo chmod -R 755 /Library/Extensions/RX9070XT.kext
    sudo kmutil install --volume-root / --update-all
@@ -96,8 +120,10 @@ file build/RX9070XT.kext/Contents/MacOS/RX9070XT   # Mach-O 64-bit kext bundle x
 3. Recommended while bringing this up: `-v keepsyms=1` boot-args, and disable
    other GPU-related kexts (WhateverGreen) so nothing fights over the device.
 
-**Do not install this on a machine you can't recover** — a misbehaving
-framebuffer kext can black-screen the boot. Keep a known-good EFI to swap back.
+**Recovery:** if a build misbehaves, add `rx9070xt-off=1` to boot-args — the
+kext declines to match and macOS falls back to its EFI framebuffer. Worst
+case (kext wedges boot before the kill switch existed): boot Safe Mode (`-x`),
+which skips the Aux KC entirely, then remove the bundle and rebuild the KC.
 
 ## Roadmap — from "framebuffer" to "real driver"
 
@@ -105,27 +131,26 @@ Rough order of increasing difficulty. Each step needs iteration on the actual
 hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
 `amdgpu` sources (`drivers/gpu/drm/amd/`) are the references.
 
-1. **Confirm scanout adoption** — get the desktop up on the GOP buffer (this
-   kext). Validate stride/format against what you actually see.
-2. **Mode setting** — parse the AtomBIOS tables (`atomfirmware.h` in amdgpu)
-   and drive **DCN 4.0.1** (Navi 48's display controller) to change resolution
-   / light up other connectors. This is where `enableController()` stops being
-   a no-op. *Started:* `AtomBios.{hpp,cpp}` parses the ROM header, master data
-   table v2.1, firmwareinfo v3.5 and displayobjectinfo v1.5 — verified against
-   this card's ROM (`make test`), which reports 2× DisplayPort + 2× HDMI-A.
-   At runtime the kext obtains the VBIOS from an injected `ATY,bin_image`
-   device property (preferred) or the PCI expansion ROM, and publishes
-   `AtomBIOS,*` properties on the framebuffer node.
-3. **Multiple connectors & EDID** — read EDID over DP/HDMI AUX, publish real
-   timings from `getInformationForDisplayMode`. *Prerequisite done:* the
-   parser now decodes each connector's record chain (I2C/AUX + HPD) and the
-   GPIO pin LUT, giving the DDC line and HPD pin register mapping per
-   connector (verified via `make test`: DP→ddc0/hpd1, DP→ddc1/hpd2,
-   HDMI→ddc2/hpd3, HDMI→ddc3/hpd4; DDC regs 0x5d91/95/99/9d, HPD bank
-   0x5db5). Next: drive those DC_GPIO registers / AUX engine over BAR5 MMIO.
-4. **Power / clocks** — SMU firmware handshake (see `../firmware` power tables)
-   so the card is stable, not stuck at boot clocks.
-5. **Acceleration (huge)** — a real accelerator: GFX12 command processor, ring
+1. ~~**Confirm scanout adoption**~~ — **done.** Desktop verified on hardware
+   with correct colors (after masking the `v_baseAddr` flag bits).
+2. **EDID over DP AUX** *(next)* — read each sink's EDID using the AUX engine
+   at the DDC registers already mapped per connector, publish real display
+   identity/timings instead of the generic `'unkn'` display. Gateway to both
+   multi-display and display power management. *Prerequisites done:* the
+   connector→DDC/HPD map (DP→ddc0/hpd1, DP→ddc1/hpd2, HDMI→ddc2/hpd3,
+   HDMI→ddc3/hpd4; DDC regs 0x5d91/95/99/9d, HPD bank 0x5db5, verified via
+   `make test`) and a proven BAR5 read/write path with discovery-derived
+   addressing.
+3. **Native mode setting (DCN 4.1.0)** — program HUBP/DPP/OPP/OTG to change
+   resolution and light additional connectors; this is where
+   `enableController()` stops being a no-op. The register-offset workflow
+   (Linux `dcn_4_1_0_offset.h` + IP discovery segment bases) is established
+   from the color investigation.
+4. **Display power management** — blank/unblank scanout for display sleep;
+   register proper IOFramebuffer power states.
+5. **Power / clocks** — SMU firmware handshake so the card is stable, not
+   stuck at boot clocks.
+6. **Acceleration (huge)** — a real accelerator: GFX12 command processor, ring
    buffers, memory controller, and a Metal driver. This is effectively
    reimplementing Apple's `AMDRadeonX6000` family for a new architecture and is
    out of scope for this repo's near term.
@@ -133,18 +158,21 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
 ## Status
 
 - [x] Cross-compiles on Apple Silicon → x86_64 kext bundle
-- [x] Lilu plugin bootstrap + PCI framebuffer personality
+- [x] Standalone (Lilu-free) kext, loads from /Library/Extensions via Aux KC
 - [x] Adopts firmware/GOP linear framebuffer, one fixed 32bpp mode
+- [x] **Boots to a 4K desktop on real hardware with correct colors**
+      (WindowServer verified compositing on this framebuffer)
 - [x] AtomBIOS parser (rom header, master data table, firmwareinfo,
       display paths) verified against the real ROM via `make test`
 - [x] Runtime VBIOS acquisition (`ATY,bin_image` property / expansion ROM)
 - [x] Per-connector DDC/AUX line + HPD pin mapping (path records +
       gpio_pin_lut), published as `AtomBIOS,Connectors`
-- [x] Adopted console geometry published as `Console,*` registry properties
 - [x] IP discovery parser: GC v12.0.1 / DCN v4.1.0 / NBIF v6.3.1 register
       segment bases extracted from the ROM (`make test` gates on them)
-- [x] BAR5 register MMIO mapping + smoke-test read (RCC_CONFIG_MEMSIZE →
-      `VRAM,TotalMB` / `MMIO,Verified` properties; needs hardware to confirm)
-- [ ] Verified booting to desktop on real RX 9070 XT hardware
-- [ ] Native mode setting (DCN 4.0.1)
+- [x] BAR5 register MMIO confirmed on hardware, read (VRAM size, DCN dumps)
+      and write (DP stream registers, MCM bypass)
+- [x] Kill-switch boot-arg (`rx9070xt-off=1`) for safe iteration
+- [ ] EDID over DP AUX (next)
+- [ ] Native mode setting (DCN 4.1.0) / multiple displays
+- [ ] Display sleep / power management
 - [ ] Acceleration / Metal
