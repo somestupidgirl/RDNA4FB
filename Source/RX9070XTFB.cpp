@@ -29,7 +29,15 @@ bool RX9070XTFB::captureConsoleInfo() {
 		return false;
 	}
 
-	fbPhysBase = static_cast<IOPhysicalAddress64>(video.v_baseAddr);
+	// v_baseAddr carries flag bits in its low bits (observed 0x840000001 on
+	// this machine); the scanout base itself is page-aligned. Apple's own
+	// framebuffer code masks these off — failing to do so hands WindowServer
+	// an aperture shifted one byte from the real scanout, which recolours
+	// every pixel (B'=prev alpha, G'=B, R'=G).
+	fbPhysBase = static_cast<IOPhysicalAddress64>(video.v_baseAddr) & ~0xFFFULL;
+	if (video.v_baseAddr & 0xFFF)
+		FBLOG("console base 0x%lx carries flag bits, using 0x%llx",
+		      video.v_baseAddr, fbPhysBase);
 	fbWidth    = static_cast<uint32_t>(video.v_width);
 	fbHeight   = static_cast<uint32_t>(video.v_height);
 	fbRowBytes = static_cast<uint32_t>(video.v_rowBytes);
