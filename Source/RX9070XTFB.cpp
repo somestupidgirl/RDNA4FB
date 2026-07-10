@@ -271,46 +271,31 @@ void RX9070XTFB::dumpDCN() {
 	// {name, base_idx, dword offset} — offsets from Linux dcn_4_1_0_offset.h.
 	// This is the console pipe the firmware lit up; if these read as identity
 	// we will widen to pipes 1-3.
-	struct Reg { const char *name; uint8_t base; uint32_t off; };
-	static const Reg regs[] = {
-		// Surface format + fixed-point conversion bias/scale (blue-floor suspect).
-		{ "CNVC0_SURFACE_PIXEL_FORMAT",2, 0x0ccf },
-		{ "CNVC0_FORMAT_CONTROL",      2, 0x0cd0 },
-		{ "CNVC0_FCNV_FP_BIAS_R",      2, 0x0cd1 },
-		{ "CNVC0_FCNV_FP_BIAS_G",      2, 0x0cd2 },
-		{ "CNVC0_FCNV_FP_BIAS_B",      2, 0x0cd3 },
-		{ "CNVC0_FCNV_FP_SCALE_R",     2, 0x0cd4 },
-		{ "CNVC0_FCNV_FP_SCALE_G",     2, 0x0cd5 },
-		{ "CNVC0_FCNV_FP_SCALE_B",     2, 0x0cd6 },
-		// Per-pipe input CSC — a (G,B,R) permutation matrix would appear here.
-		{ "CNVC0_PRE_CSC_MODE",        2, 0x0cdf },
-		{ "CNVC0_PRE_CSC_C11_C12",     2, 0x0ce0 },
-		{ "CNVC0_PRE_CSC_C13_C14",     2, 0x0ce1 },
-		{ "CNVC0_PRE_CSC_C21_C22",     2, 0x0ce2 },
-		{ "CNVC0_PRE_CSC_C23_C24",     2, 0x0ce3 },
-		{ "CNVC0_PRE_CSC_C31_C32",     2, 0x0ce4 },
-		{ "CNVC0_PRE_CSC_C33_C34",     2, 0x0ce5 }, // C34 = offset term (blue floor)
-		// Post-blend CSC — the other place a permutation + offset could live.
-		{ "CM0_CM_CONTROL",            2, 0x0d67 },
-		{ "CM0_CM_POST_CSC_CONTROL",   2, 0x0d68 },
-		{ "CM0_CM_POST_CSC_C11_C12",   2, 0x0d69 },
-		{ "CM0_CM_POST_CSC_C13_C14",   2, 0x0d6a },
-		{ "CM0_CM_POST_CSC_C21_C22",   2, 0x0d6b },
-		{ "CM0_CM_POST_CSC_C23_C24",   2, 0x0d6c },
-		{ "CM0_CM_POST_CSC_C31_C32",   2, 0x0d6d },
-		{ "CM0_CM_POST_CSC_C33_C34",   2, 0x0d6e },
-		{ "CM0_CM_BIAS_CR_R",          2, 0x0d75 },
-		{ "CM0_CM_BIAS_Y_G_CB_B",      2, 0x0d76 },
-		{ "CM0_CM_GAMCOR_CONTROL",     2, 0x0d77 }, // output gamma mode (inversion/tint suspect)
-		{ "CM0_CM_COEF_FORMAT",        2, 0x0dc6 },
-		// Kept for context.
-		{ "OTG0_OTG_CONTROL",          2, 0x1b43 },
-		{ "MPC_OUT0_CSC_MODE",         3, 0x030b },
+	// Pipe 0 was fully identity, so the active display must be on another
+	// HUBP/DPP/MPCC chain. Scan all four pipes: surface config (enable +
+	// format) and both CSCs. Identity CSC reads C11/C22 = 0x2000; a (G,B,R)
+	// permutation instead has C12/C31 = 0x2000 with C11 = 0.
+	struct Pipe { uint32_t hubpCfg, preMode, preC11, preC21, preC31,
+	                       postCtl, postC11, postC21, postC31; };
+	static const Pipe pipes[4] = {
+		{ 0x05e5, 0x0cdf, 0x0ce0, 0x0ce2, 0x0ce4, 0x0d68, 0x0d69, 0x0d6b, 0x0d6d },
+		{ 0x06c1, 0x0e4a, 0x0e4b, 0x0e4d, 0x0e4f, 0x0ed3, 0x0ed4, 0x0ed6, 0x0ed8 },
+		{ 0x079d, 0x0fb5, 0x0fb6, 0x0fb8, 0x0fba, 0x103e, 0x103f, 0x1041, 0x1043 },
+		{ 0x0879, 0x1120, 0x1121, 0x1123, 0x1125, 0x11a9, 0x11aa, 0x11ac, 0x11ae },
 	};
 
-	FBLOG("dcn: register dump (DMU bases seg2/seg3, read-only) ---");
-	for (auto &r : regs)
-		FBLOG("dcn:   %-30s = 0x%08x", r.name, regReadDmu(r.base, r.off));
+	FBLOG("dcn: register dump (all pipes, read-only) ---");
+	FBLOG("dcn:   OTG0_OTG_CONTROL = 0x%08x  MPC_OUT0_CSC_MODE = 0x%08x",
+	      regReadDmu(2, 0x1b43), regReadDmu(3, 0x030b));
+	for (int i = 0; i < 4; i++) {
+		const Pipe &p = pipes[i];
+		FBLOG("dcn:   HUBP%d surf_cfg=0x%08x | PRE mode=0x%08x C11=0x%08x C21=0x%08x C31=0x%08x",
+		      i, regReadDmu(2, p.hubpCfg), regReadDmu(2, p.preMode),
+		      regReadDmu(2, p.preC11), regReadDmu(2, p.preC21), regReadDmu(2, p.preC31));
+		FBLOG("dcn:   pipe%d POST ctl=0x%08x C11=0x%08x C21=0x%08x C31=0x%08x",
+		      i, regReadDmu(2, p.postCtl), regReadDmu(2, p.postC11),
+		      regReadDmu(2, p.postC21), regReadDmu(2, p.postC31));
+	}
 	FBLOG("dcn: --- end register dump ---");
 }
 
