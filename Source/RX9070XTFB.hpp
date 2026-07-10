@@ -46,6 +46,10 @@ class RX9070XTFB : public IOFramebuffer {
 	uint32_t            fbRowBytes { 0 };
 	uint32_t            fbDepth    { 32 };
 
+	// Diagnostic: boot-arg "rx9070xt-bgr=1" swaps the red/blue component
+	// masks reported to WindowServer, to test scanout byte-order mismatches.
+	bool swapRedBlue { false };
+
 	// VBIOS image (owned copy) and its parsed view. Populated by loadVBIOS();
 	// absence is non-fatal — the framebuffer works without it, but connector
 	// knowledge is needed for future native mode setting.

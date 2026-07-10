@@ -276,8 +276,10 @@ void RX9070XTFB::probeMemSize() {
 	FBLOG("mmio: VRAM size %u MiB (RCC_CONFIG_MEMSIZE @ 0x%x)", memsizeMB, off);
 	setProperty("VRAM,TotalMB", static_cast<uint64_t>(memsizeMB), 32);
 	// Independent confirmation that register MMIO works — the gate for all
-	// future DCN (AUX/EDID, mode setting) work.
-	setProperty("MMIO,Verified", memsizeMB == 16384);
+	// future DCN (AUX/EDID, mode setting) work. The register reports usable
+	// VRAM (nominal size minus firmware reservations: 16304 on this 16 GiB
+	// card), so accept any plausible value rather than an exact match.
+	setProperty("MMIO,Verified", memsizeMB >= 1024 && memsizeMB <= 65536);
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +314,12 @@ bool RX9070XTFB::start(IOService *provider) {
 	if (!pciDevice) {
 		FBLOG("start: no PCI provider");
 		return false;
+	}
+
+	uint32_t bgr = 0;
+	if (PE_parse_boot_argn("rx9070xt-bgr", &bgr, sizeof(bgr)) && bgr != 0) {
+		swapRedBlue = true;
+		FBLOG("start: swapping R/B component masks (rx9070xt-bgr)");
 	}
 
 	// Grab the bootloader-provided framebuffer before anything else touches it.
@@ -442,10 +450,11 @@ IOReturn RX9070XTFB::getPixelInformation(IODisplayModeID displayMode, IOIndex de
 	pixelInfo->pixelType        = kIORGBDirectPixels;
 	pixelInfo->componentCount   = 3;
 	pixelInfo->bitsPerComponent = 8;
-	// ARGB8888 / XRGB8888 little-endian: R,G,B masks.
-	pixelInfo->componentMasks[0] = 0x00FF0000; // R
-	pixelInfo->componentMasks[1] = 0x0000FF00; // G
-	pixelInfo->componentMasks[2] = 0x000000FF; // B
+	// ARGB8888 / XRGB8888 little-endian: R,G,B masks. rx9070xt-bgr swaps
+	// R and B for scanout byte-order diagnostics.
+	pixelInfo->componentMasks[0] = swapRedBlue ? 0x000000FF : 0x00FF0000; // R
+	pixelInfo->componentMasks[1] = 0x0000FF00;                            // G
+	pixelInfo->componentMasks[2] = swapRedBlue ? 0x00FF0000 : 0x000000FF; // B
 	strlcpy(pixelInfo->pixelFormat, IO32BitDirectPixels, sizeof(pixelInfo->pixelFormat));
 	pixelInfo->activeWidth  = fbWidth;
 	pixelInfo->activeHeight = fbHeight;
