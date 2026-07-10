@@ -271,31 +271,25 @@ void RX9070XTFB::dumpDCN() {
 	// {name, base_idx, dword offset} — offsets from Linux dcn_4_1_0_offset.h.
 	// This is the console pipe the firmware lit up; if these read as identity
 	// we will widen to pipes 1-3.
-	// Pipe 0 was fully identity, so the active display must be on another
-	// HUBP/DPP/MPCC chain. Scan all four pipes: surface config (enable +
-	// format) and both CSCs. Identity CSC reads C11/C22 = 0x2000; a (G,B,R)
-	// permutation instead has C12/C31 = 0x2000 with C11 = 0.
-	struct Pipe { uint32_t hubpCfg, preMode, preC11, preC21, preC31,
-	                       postCtl, postC11, postC21, postC31; };
-	static const Pipe pipes[4] = {
-		{ 0x05e5, 0x0cdf, 0x0ce0, 0x0ce2, 0x0ce4, 0x0d68, 0x0d69, 0x0d6b, 0x0d6d },
-		{ 0x06c1, 0x0e4a, 0x0e4b, 0x0e4d, 0x0e4f, 0x0ed3, 0x0ed4, 0x0ed6, 0x0ed8 },
-		{ 0x079d, 0x0fb5, 0x0fb6, 0x0fb8, 0x0fba, 0x103e, 0x103f, 0x1041, 0x1043 },
-		{ 0x0879, 0x1120, 0x1121, 0x1123, 0x1125, 0x11a9, 0x11aa, 0x11ac, 0x11ae },
+	// All pipe color blocks read identity, so the (G,B,R) rotation is not in
+	// the DCN color pipe. Prime suspect now: the DP stream encoder emitting
+	// YCbCr while the sink assumes RGB. Dump each DP encoder's pixel format
+	// (DP_PIXEL_ENCODING: 0=RGB, 1=YCbCr422, 2=YCbCr444) and MSA colorimetry,
+	// plus each HUBP surface config to identify the active pipe.
+	struct DpEnc { uint32_t pixFmt, colorimetry; };
+	static const DpEnc dp[4] = {
+		{ 0x211f, 0x2120 }, { 0x2243, 0x2244 }, { 0x2367, 0x2368 }, { 0x248b, 0x248c },
 	};
+	static const uint32_t hubpCfg[4] = { 0x05e5, 0x06c1, 0x079d, 0x0879 };
+	static const uint32_t digFeCntl[4] = { 0x2093, 0x21b7 /*+0x124*/, 0x22db, 0x23ff };
 
-	FBLOG("dcn: register dump (all pipes, read-only) ---");
-	FBLOG("dcn:   OTG0_OTG_CONTROL = 0x%08x  MPC_OUT0_CSC_MODE = 0x%08x",
-	      regReadDmu(2, 0x1b43), regReadDmu(3, 0x030b));
-	for (int i = 0; i < 4; i++) {
-		const Pipe &p = pipes[i];
-		FBLOG("dcn:   HUBP%d surf_cfg=0x%08x | PRE mode=0x%08x C11=0x%08x C21=0x%08x C31=0x%08x",
-		      i, regReadDmu(2, p.hubpCfg), regReadDmu(2, p.preMode),
-		      regReadDmu(2, p.preC11), regReadDmu(2, p.preC21), regReadDmu(2, p.preC31));
-		FBLOG("dcn:   pipe%d POST ctl=0x%08x C11=0x%08x C21=0x%08x C31=0x%08x",
-		      i, regReadDmu(2, p.postCtl), regReadDmu(2, p.postC11),
-		      regReadDmu(2, p.postC21), regReadDmu(2, p.postC31));
-	}
+	FBLOG("dcn: register dump (encoders, read-only) ---");
+	FBLOG("dcn:   OTG0_OTG_CONTROL = 0x%08x", regReadDmu(2, 0x1b43));
+	for (int i = 0; i < 4; i++)
+		FBLOG("dcn:   [%d] HUBP_surf=0x%08x DP_PIXEL_FORMAT=0x%08x DP_MSA_COLORIMETRY=0x%08x DIG_FE_CNTL=0x%08x",
+		      i, regReadDmu(2, hubpCfg[i]), regReadDmu(2, dp[i].pixFmt),
+		      regReadDmu(2, dp[i].colorimetry), regReadDmu(2, digFeCntl[i]));
+	FBLOG("dcn:   DP0_DP_MSA_MISC = 0x%08x", regReadDmu(2, 0x2124));
 	FBLOG("dcn: --- end register dump ---");
 }
 
