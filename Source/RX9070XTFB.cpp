@@ -685,6 +685,10 @@ void RX9070XTFB::setDisplayPower(bool on) {
 }
 
 void RX9070XTFB::initForPM() {
+	if (pmRegistered)
+		return;
+	pmRegistered = true;
+
 	// States and flags mirror IONDRVFramebuffer::initForPM: 0 = sleep,
 	// 1 = doze (display blanked, framebuffer preserved), 2 = wake.
 	static IOPMPowerState powerStates[3] = {
@@ -867,10 +871,6 @@ bool RX9070XTFB::start(IOService *provider) {
 		return false;
 	}
 
-	// After super::start (which does PMinit/joinPMtree) declare our power
-	// states so display sleep can actually reach setAttribute.
-	initForPM();
-
 	FBLOG("started");
 	return true;
 }
@@ -891,6 +891,14 @@ IOReturn RX9070XTFB::enableController() {
 	// pipe and scanout address. We just re-validate the console geometry.
 	if (fbPhysBase == 0 && !captureConsoleInfo())
 		return kIOReturnNoResources;
+
+	// Register power states here, not in start(): IOFramebuffer's power
+	// machinery is only ready once the framebuffer is opened (this is where
+	// IONDRVFramebuffer::enableController calls its initForPM too).
+	// Registering from start() hung boot: registerPowerDriver kicks off an
+	// immediate power change into IOFramebuffer::setPowerState before the
+	// controller/workloop state it needs exists.
+	initForPM();
 
 	FBLOG("enableController: adopting firmware scanout %ux%u", fbWidth, fbHeight);
 	return kIOReturnSuccess;

@@ -160,8 +160,10 @@ class RX9070XTFB : public IOFramebuffer {
 	// subclass must call registerPowerDriver itself (IONDRVFramebuffer does
 	// this in its initForPM), otherwise PM has no states to change and
 	// setPowerState / kIOPowerAttribute are never delivered. This was why
-	// display sleep did nothing.
+	// display sleep did nothing. Must run from enableController() — the
+	// framebuffer must be open before PM starts delivering state changes.
 	void initForPM();
+	bool pmRegistered { false };
 
 public:
 	// IOService
