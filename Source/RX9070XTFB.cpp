@@ -568,25 +568,30 @@ void RX9070XTFB::probeEDID() {
 	for (size_t i = 0; i < n; i++) {
 		AtomBios::ConnectorType ct =
 		    AtomBios::connectorType(paths[i].connectorObjId);
-		// Only DisplayPort/USB-C sinks carry DDC on the AUX channel; HDMI/DVI
-		// EDID travels over the separate I2C controller (not yet implemented).
-		if (ct != AtomBios::ConnectorDP && ct != AtomBios::ConnectorUSBC)
+		// DisplayPort/USB-C sinks carry DDC on the AUX channel; HDMI/DVI
+		// EDID travels over the DC_I2C hardware engine.
+		bool viaAux = (ct == AtomBios::ConnectorDP || ct == AtomBios::ConnectorUSBC);
+		bool viaI2c = (ct == AtomBios::ConnectorHDMIA || ct == AtomBios::ConnectorDVID);
+		if (!viaAux && !viaI2c)
 			continue;
 
 		AtomBios::PathRecords rec {};
 		atomBios.getPathRecords(paths[i], rec);
-		uint8_t inst = rec.ddcLine;  // AUX engine index == DDC line on this board
+		uint8_t inst = rec.ddcLine;  // AUX engine / DDC line index
+		const char *bus = viaAux ? "AUX" : "DDC";
 
 		uint8_t edid[128] {};
-		if (!readEDID(inst, edid, sizeof(edid), 0)) {
-			FBLOG("edid: connector %zu (AUX%u): no reply", i, inst);
+		bool got = viaAux ? readEDID(inst, edid, sizeof(edid), 0)
+		                  : readEDIDI2C(inst, edid, sizeof(edid), 0);
+		if (!got) {
+			FBLOG("edid: connector %zu (%s%u): no reply", i, bus, inst);
 			continue;
 		}
 
 		static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
 		if (memcmp(edid, sig, sizeof(sig)) != 0) {
-			FBLOG("edid: connector %zu (AUX%u): data but bad header "
-			      "%02x %02x %02x %02x", i, inst, edid[0], edid[1], edid[2], edid[3]);
+			FBLOG("edid: connector %zu (%s%u): data but bad header "
+			      "%02x %02x %02x %02x", i, bus, inst, edid[0], edid[1], edid[2], edid[3]);
 			continue;
 		}
 		any = true;
@@ -602,14 +607,14 @@ void RX9070XTFB::probeEDID() {
 		const uint8_t *d = edid + 54;
 		uint32_t hres = d[2] | ((static_cast<uint32_t>(d[4] & 0xf0)) << 4);
 		uint32_t vres = d[5] | ((static_cast<uint32_t>(d[7] & 0xf0)) << 4);
-		FBLOG("edid: connector %zu (AUX%u): %s product 0x%04x EDID %u.%u "
-		      "preferred %ux%u", i, inst, mfg, product, edid[18], edid[19],
+		FBLOG("edid: connector %zu (%s%u): %s product 0x%04x EDID %u.%u "
+		      "preferred %ux%u", i, bus, inst, mfg, product, edid[18], edid[19],
 		      hres, vres);
 
 		char key[40];
-		snprintf(key, sizeof(key), "EDID,AUX%u", inst);
+		snprintf(key, sizeof(key), "EDID,%s%u", bus, inst);
 		setProperty(key, edid, sizeof(edid));
-		snprintf(key, sizeof(key), "EDID,AUX%u-Vendor", inst);
+		snprintf(key, sizeof(key), "EDID,%s%u-Vendor", bus, inst);
 		setProperty(key, mfg);
 
 		// Cache the first sink's EDID for hasDDCConnect()/getDDCBlock(). Only
@@ -617,20 +622,166 @@ void RX9070XTFB::probeEDID() {
 		if (edidLen == 0) {
 			memcpy(edidData, edid, 128);
 			edidLen = 128;
-			sinkAuxInst = inst;
-			sinkAuxValid = true;
+			if (viaAux) {   // DPCD power writes only exist on AUX sinks
+				sinkAuxInst = inst;
+				sinkAuxValid = true;
+			}
 			// One CTA extension block is the norm on EDID 1.4 sinks; fetch it
 			// so the OS sees the full timing/audio capabilities.
-			if (edid[126] > 0 &&
-			    readEDID(inst, edidData + 128, 128, 128)) {
+			bool ext = edid[126] > 0 &&
+			           (viaAux ? readEDID(inst, edidData + 128, 128, 128)
+			                   : readEDIDI2C(inst, edidData + 128, 128, 128));
+			if (ext) {
 				edidLen = 256;
-				FBLOG("edid: connector %zu (AUX%u): read extension block "
-				      "(tag 0x%02x)", i, inst, edidData[128]);
+				FBLOG("edid: connector %zu (%s%u): read extension block "
+				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
 		}
 	}
 	if (!any)
-		FBLOG("edid: no DisplayPort EDID read (HDMI DDC over I2C not yet supported)");
+		FBLOG("edid: no sink EDID read on any connector");
+}
+
+namespace {
+// DC_I2C hardware engine (dcn_4_1_0_offset.h, all base_idx 2). One shared
+// engine; per-DDC-line SETUP/SPEED registers plus a DDC_SELECT mux.
+constexpr uint32_t kI2cControl     = 0x1e98;
+constexpr uint32_t kI2cArbitration = 0x1e99;
+constexpr uint32_t kI2cSwStatus    = 0x1e9b;
+constexpr uint32_t kI2cSpeedBase   = 0x1ea2;  // + 2*line
+constexpr uint32_t kI2cSetupBase   = 0x1ea3;  // + 2*line
+constexpr uint32_t kI2cTxn0        = 0x1eae;  // txn N at +N
+constexpr uint32_t kI2cDataReg     = 0x1eb2;
+
+// DC_I2C_CONTROL fields.
+constexpr uint32_t kI2cGo             = 1u << 0;
+constexpr uint32_t kI2cSoftReset      = 1u << 1;
+constexpr uint32_t kI2cSwStatusReset  = 1u << 3;
+constexpr uint32_t kI2cDdcSelectShift = 8;       // [10:8]
+constexpr uint32_t kI2cTxnCountShift  = 20;      // [21:20]
+// DC_I2C_ARBITRATION fields.
+constexpr uint32_t kI2cRwStatusShift  = 2;       // [3:2]: 0 idle, 1 SW, 2 HW
+constexpr uint32_t kI2cRwStatusMask   = 0x3u << 2;
+constexpr uint32_t kI2cNoQueuedSwGo   = 1u << 4;
+constexpr uint32_t kI2cSwUseReq       = 1u << 20;
+constexpr uint32_t kI2cSwDoneUsing    = 1u << 21;
+// DC_I2C_SW_STATUS fields.
+constexpr uint32_t kI2cSwDone         = 1u << 2;
+constexpr uint32_t kI2cSwAborted      = 1u << 4;
+constexpr uint32_t kI2cSwTimeout      = 1u << 5;
+constexpr uint32_t kI2cSwOverflow     = 1u << 7;
+constexpr uint32_t kI2cStoppedOnNack  = 1u << 8;
+// DC_I2C_DDCx_SETUP fields (DCN values: TIME_LIMIT 3, 9-bit send-reset).
+constexpr uint32_t kI2cSetupEnable    = 1u << 6;
+constexpr uint32_t kI2cSetupValue     = kI2cSetupEnable | (1u << 2) | (3u << 24);
+// DC_I2C_DDCx_SPEED fields.
+constexpr uint32_t kI2cSpeed100kHz    = 100;     // kHz, amdgpu's DCN default
+// DC_I2C_TRANSACTIONx fields.
+constexpr uint32_t kTxnRead           = 1u << 0;
+constexpr uint32_t kTxnStopOnNack     = 1u << 8;
+constexpr uint32_t kTxnStart          = 1u << 12;
+constexpr uint32_t kTxnStop           = 1u << 13;
+constexpr uint32_t kTxnCountShift     = 16;      // [25:16]
+// DC_I2C_DATA fields.
+constexpr uint32_t kI2cDataRead       = 1u << 0;
+constexpr uint32_t kI2cDataShiftI2C   = 8;       // [15:8]
+constexpr uint32_t kI2cIndexShift     = 16;      // [25:16]
+constexpr uint32_t kI2cIndexWrite     = 1u << 31;
+
+// MICROSECOND_TIME_BASE_DIV (DMU base_idx 1): reference for SCL prescale.
+constexpr uint32_t kMicrosecondTimeBaseDiv = 0x007b;
+} // namespace
+
+bool RX9070XTFB::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
+                             uint8_t start) {
+	if (!ipDiscovery.isValid() || !rmmio || count == 0 || count > 256)
+		return false;
+
+	const uint32_t rSetup = kI2cSetupBase + 2u * line;
+	const uint32_t rSpeed = kI2cSpeedBase + 2u * line;
+
+	// --- acquire (dce_i2c_hw acquire_engine) ---
+	uint32_t arb = regReadDmu(2, kI2cArbitration);
+	if (arb == 0xFFFFFFFF)
+		return false;
+	uint32_t owner = (arb & kI2cRwStatusMask) >> kI2cRwStatusShift;
+	if (owner == 2)          // hardware/DMCU owns the engine
+		return false;
+	if (owner != 1) {
+		regWriteDmu(2, kI2cArbitration, arb | kI2cSwUseReq);
+		arb = regReadDmu(2, kI2cArbitration);
+		if (((arb & kI2cRwStatusMask) >> kI2cRwStatusShift) != 1)
+			return false;
+	}
+	auto release = [&]() {
+		// Soft reset is safe while SW owns the engine; DONE_USING clears
+		// the SW request and hands the engine back.
+		regWriteDmu(2, kI2cControl, kI2cSoftReset | kI2cSwStatusReset);
+		regWriteDmu(2, rSetup, 0);
+		regWriteDmu(2, kI2cArbitration,
+		            regReadDmu(2, kI2cArbitration) | kI2cSwDoneUsing);
+	};
+
+	// --- engine setup (setup_engine) ---
+	regWriteDmu(2, rSetup, kI2cSetupValue);
+	regWriteDmu(2, kI2cControl,
+	            kI2cSwStatusReset | (static_cast<uint32_t>(line) << kI2cDdcSelectShift));
+	regWriteDmu(2, kI2cArbitration,
+	            (regReadDmu(2, kI2cArbitration) | kI2cSwUseReq) & ~kI2cNoQueuedSwGo);
+
+	// SCL speed: prescale from the microsecond time base (set_speed). If the
+	// time base is unprogrammed, keep whatever speed the firmware left.
+	uint32_t mtb = regReadDmu(1, kMicrosecondTimeBaseDiv);
+	uint32_t refBase = mtb & 0x7f, xtalDiv = (mtb >> 8) & 0x7f;
+	if (mtb != 0xFFFFFFFF && refBase != 0) {
+		if (xtalDiv == 0)
+			xtalDiv = 2;
+		uint32_t prescale = (refBase * 1000 / xtalDiv) / kI2cSpeed100kHz;
+		regWriteDmu(2, rSpeed, (prescale << 16) | (2u << 8) | 2u);
+	}
+
+	// --- queue both transactions, then a single GO (process_transaction /
+	// execute_transaction): [START 0xA0 <start>] [START 0xA1 read*count STOP]
+	regWriteDmu(2, kI2cTxn0,
+	            kTxnStopOnNack | kTxnStart | (1u << kTxnCountShift));
+	regWriteDmu(2, kI2cTxn0 + 1,
+	            kTxnStopOnNack | kTxnStart | kTxnRead | kTxnStop |
+	            (static_cast<uint32_t>(count) << kTxnCountShift));
+	// Data FIFO: address bytes carry the R/W bit in bit 0.
+	regWriteDmu(2, kI2cDataReg, kI2cIndexWrite | (0xA0u << kI2cDataShiftI2C));
+	regWriteDmu(2, kI2cDataReg, static_cast<uint32_t>(start) << kI2cDataShiftI2C);
+	regWriteDmu(2, kI2cDataReg, 0xA1u << kI2cDataShiftI2C);
+
+	uint32_t ctl = (static_cast<uint32_t>(line) << kI2cDdcSelectShift) |
+	               (1u << kI2cTxnCountShift);  // TRANSACTION_COUNT = 2-1
+	regWriteDmu(2, kI2cControl, ctl);
+	regWriteDmu(2, kI2cControl, ctl | kI2cGo);
+
+	// --- poll for completion. 129 bytes at 100 kHz is ~12 ms; allow 100 ms.
+	uint32_t sts = 0;
+	bool done = false;
+	for (int i = 0; i < 10000; i++) {
+		sts = regReadDmu(2, kI2cSwStatus);
+		if (sts & (kI2cStoppedOnNack | kI2cSwTimeout | kI2cSwAborted | kI2cSwOverflow))
+			break;
+		if (sts & kI2cSwDone) { done = true; break; }
+		IODelay(10);
+	}
+	if (!done || (sts & (kI2cStoppedOnNack | kI2cSwTimeout | kI2cSwAborted | kI2cSwOverflow))) {
+		release();
+		return false;   // NACK = nothing connected on this line
+	}
+
+	// --- read the reply FIFO (process_channel_reply): the read data starts
+	// after the 3 bytes we wrote (0xA0, start, 0xA1).
+	regWriteDmu(2, kI2cDataReg,
+	            kI2cIndexWrite | kI2cDataRead | (3u << kI2cIndexShift));
+	for (size_t i = 0; i < count; i++)
+		edid[i] = static_cast<uint8_t>(
+		    (regReadDmu(2, kI2cDataReg) >> kI2cDataShiftI2C) & 0xff);
+
+	release();
+	return true;
 }
 
 void RX9070XTFB::setDisplayPower(bool on) {

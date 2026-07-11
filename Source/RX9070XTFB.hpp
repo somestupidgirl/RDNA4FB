@@ -131,6 +131,12 @@ class RX9070XTFB : public IOFramebuffer {
 	// sink on engine `inst`, starting at EDID byte `start` (0 for the base
 	// block, 128 for the first extension). Returns true and fills `edid`.
 	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start);
+	// Same, over the DDC hardware I2C engine (DC_I2C block) — the EDID path
+	// for HDMI/DVI sinks, which have no AUX channel. `line` is the AtomBIOS
+	// ddc-line (selects DC_I2C_DDC<line+1> and DDC_SELECT). Queues the
+	// offset write and the block read as two transactions in one GO, per
+	// amdgpu's dce_i2c_hw.c.
+	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
 	// Probe each DisplayPort connector's AUX engine for an EDID, validate and
 	// publish it, and cache the first hit for the DDC API below. Issues only
 	// AUX transactions, never reprograms scanout. Runs by default (verified on

@@ -140,7 +140,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
    EDID over I2C-over-AUX; verified on hardware 2026-07-11 (Samsung 4K sink
    on AUX0). The EDID (base + CTA extension) is served to IODisplay via
    `hasDDCConnect()`/`getDDCBlock()` so macOS sees the real display identity.
-   *Remaining:* HDMI sinks (EDID lives on the DDC I2C engine, not AUX).
+   HDMI/DVI sinks are read too, via the DC_I2C hardware engine (per amdgpu's
+   `dce_i2c_hw.c`: offset write + block read queued as two transactions in a
+   single GO) — awaiting hardware verification.
 3. **Native mode setting (DCN 4.1.0)** — program HUBP/DPP/OPP/OTG to change
    resolution and light additional connectors; this is where
    `enableController()` stops being a no-op. The register-offset workflow
@@ -185,6 +187,8 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
 - [x] Kill-switch boot-arg (`rx9070xt-off=1`) for safe iteration
 - [x] DP AUX software engine + EDID read over I2C-over-AUX (verified on
       hardware: Samsung 4K sink on AUX0), served via `getDDCBlock()`
+- [ ] HDMI/DVI EDID over the DC_I2C hardware engine (implemented; needs
+      hardware verification with the HDMI monitor attached)
 - [x] Display sleep verified on hardware: stream blank + sink D3 over native
       AUX on sleep, D0 + stream re-enable on wake (system sleep vetoed until
       mode setting exists)
