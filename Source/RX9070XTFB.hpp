@@ -109,6 +109,32 @@ class RX9070XTFB : public IOFramebuffer {
 	// be located before any register is written. Writes nothing to hardware.
 	void dumpDCN();
 
+	// DP AUX software engine (BAR5 MMIO, one block per connector). This is the
+	// path to reading a sink's EDID — and later link/mode setting — without an
+	// accelerator. The register layout and programming sequence follow Navi 48's
+	// dcn_4_1_0 headers and amdgpu's dce_aux.c, which are unchanged across DCE
+	// and DCN generations.
+
+	// dword offset (all AUX regs are IP base_idx 2) of AUX register `reg`
+	// within engine instance `inst`.
+	uint32_t auxDword(uint8_t inst, uint32_t reg) const;
+	// Perform one AUX request on engine `inst`. `action` is an
+	// I2CAUX_TRANSACTION_ACTION_* value; for writes `data`/`len` are the
+	// payload, for reads `len` is the byte count requested and the reply lands
+	// in `reply` (up to `replyCap`, actual count in `*replyBytes`). Returns the
+	// AUX reply code (0 == ACK, 0x2/0x8 == AUX/I2C defer, else NACK) or -1 on
+	// engine error / HPD-low / timeout. Touches only the AUX engine registers.
+	int auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
+	                   const uint8_t *data, uint8_t len,
+	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
+	// Read `edidLen` bytes of EDID over I2C-over-AUX (DDC slave 0x50) from the
+	// sink on engine `inst`. Returns true and fills `edid` on success.
+	bool readEDID(uint8_t inst, uint8_t *edid, size_t edidLen);
+	// Boot-arg "rx9070xt-edid=1": probe each DisplayPort connector's AUX engine
+	// for an EDID, validate/decode it and log + publish it. Read-only diagnostic
+	// — issues only AUX transactions, never reprograms scanout.
+	void probeEDID();
+
 public:
 	// IOService
 	IOService *probe(IOService *provider, SInt32 *score) override;

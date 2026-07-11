@@ -337,6 +337,279 @@ void RX9070XTFB::dumpDCN() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// DP AUX software engine (EDID / DDC over the AUX channel)
+// ---------------------------------------------------------------------------
+
+namespace {
+// All AUX registers live in the DMU IP at base_idx 2. Engine `n` sits at
+// kAuxBase0 + n*kAuxStride; the members below are dword offsets within one
+// engine's block (regDP_AUXn_* from dcn_4_1_0_offset.h).
+constexpr uint32_t kAuxBase0      = 0x16b2;  // regDP_AUX0_AUX_CONTROL
+constexpr uint32_t kAuxStride     = 0x1c;    // dwords between DP_AUXn blocks
+constexpr uint32_t kAuxControl    = 0x0;
+constexpr uint32_t kAuxSwControl  = 0x1;
+constexpr uint32_t kAuxArbControl = 0x2;
+constexpr uint32_t kAuxIntControl = 0x3;
+constexpr uint32_t kAuxSwStatus   = 0x4;
+constexpr uint32_t kAuxSwData     = 0x6;
+
+// Field masks/shifts (dcn_3_2_0_sh_mask.h; identical layout on dcn_4_1_0).
+constexpr uint32_t kAuxEn                = 1u << 0;   // AUX_CONTROL.AUX_EN
+constexpr uint32_t kAuxSwGo              = 1u << 0;   // AUX_SW_CONTROL.AUX_SW_GO
+constexpr uint32_t kAuxWrBytesShift      = 16;        // AUX_SW_WR_BYTES [20:16]
+constexpr uint32_t kAuxWrBytesMask       = 0x1fu << 16;
+constexpr uint32_t kAuxRwStatShift       = 2;         // AUX_REG_RW_CNTL_STATUS [3:2]
+constexpr uint32_t kAuxRwStatMask        = 0x3u << 2;
+constexpr uint32_t kAuxUseReq            = 1u << 16;  // AUX_SW_USE_AUX_REG_REQ
+constexpr uint32_t kAuxDoneUsingReg      = 1u << 17;  // AUX_SW_DONE_USING_AUX_REG
+constexpr uint32_t kAuxDoneAck           = 1u << 1;   // INTERRUPT_CONTROL.AUX_SW_DONE_ACK
+constexpr uint32_t kAuxSwDone            = 1u << 0;   // AUX_SW_STATUS.AUX_SW_DONE
+constexpr uint32_t kAuxRxTimeoutState    = 0x7u << 4; // [6:4]
+constexpr uint32_t kAuxRxTimeout         = 1u << 7;
+constexpr uint32_t kAuxHpdDiscon         = 1u << 9;
+constexpr uint32_t kAuxReplyCountShift   = 24;        // AUX_SW_REPLY_BYTE_COUNT [28:24]
+constexpr uint32_t kAuxReplyCountMask    = 0x1fu << 24;
+constexpr uint32_t kAuxDataRw            = 1u << 0;   // AUX_SW_DATA.AUX_SW_DATA_RW (1=read)
+constexpr uint32_t kAuxDataShift         = 8;         // AUX_SW_DATA.AUX_SW_DATA [15:8]
+constexpr uint32_t kAuxDataMask          = 0xffu << 8;
+constexpr uint32_t kAuxAutoincDisable    = 1u << 31;  // AUX_SW_AUTOINCREMENT_DISABLE
+
+// enum aux_transaction_action — already aligned into the command high nibble.
+constexpr uint8_t kActI2CWriteMot = 0x40;
+constexpr uint8_t kActI2CReadMot  = 0x50;
+constexpr uint8_t kActI2CRead     = 0x10;
+
+// AUX_REG_RW_CNTL_STATUS grant codes.
+constexpr uint32_t kSwCanAccess   = 1;
+constexpr uint32_t kDmcuCanAccess = 2;
+
+// AUX reply nibble (first reply byte >> 4).
+constexpr int kReplyAck      = 0x0;  // AUX ACK + I2C ACK
+constexpr int kReplyAuxDefer = 0x2;
+constexpr int kReplyI2CDefer = 0x8;
+
+constexpr uint8_t kDdcSlave  = 0x50; // VESA DDC/EDID I2C address
+constexpr uint8_t kAuxRetry  = 7;    // per-transaction defer retries
+} // namespace
+
+uint32_t RX9070XTFB::auxDword(uint8_t inst, uint32_t reg) const {
+	return kAuxBase0 + static_cast<uint32_t>(inst) * kAuxStride + reg;
+}
+
+int RX9070XTFB::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
+                               const uint8_t *data, uint8_t len,
+                               uint8_t *reply, uint8_t replyCap,
+                               uint8_t *replyBytes) {
+	if (replyBytes) *replyBytes = 0;
+	if (!ipDiscovery.isValid() || !rmmio)
+		return -1;
+
+	const uint32_t rCtl = auxDword(inst, kAuxControl);
+	const uint32_t rArb = auxDword(inst, kAuxArbControl);
+	const uint32_t rInt = auxDword(inst, kAuxIntControl);
+	const uint32_t rSwc = auxDword(inst, kAuxSwControl);
+	const uint32_t rSts = auxDword(inst, kAuxSwStatus);
+	const uint32_t rDat = auxDword(inst, kAuxSwData);
+
+	// Release helper: hand the engine back (mirrors dce_aux release_engine).
+	auto release = [&]() {
+		regWriteDmu(2, rArb,
+		            (regReadDmu(2, rArb) & ~kAuxUseReq) | kAuxDoneUsingReg);
+	};
+
+	// --- acquire software access (dce_aux acquire_engine) ---
+	uint32_t arb = regReadDmu(2, rArb);
+	if (arb == 0xFFFFFFFF)
+		return -1;
+	if (((arb & kAuxRwStatMask) >> kAuxRwStatShift) == kDmcuCanAccess)
+		return -1;  // the firmware microcontroller owns this engine
+	uint32_t ctl = regReadDmu(2, rCtl);
+	if (!(ctl & kAuxEn))                       // GOP normally leaves AUX enabled
+		regWriteDmu(2, rCtl, ctl | kAuxEn);
+	regWriteDmu(2, rArb, regReadDmu(2, rArb) | kAuxUseReq);
+	arb = regReadDmu(2, rArb);
+	if (((arb & kAuxRwStatMask) >> kAuxRwStatShift) != kSwCanAccess) {
+		release();
+		return -1;
+	}
+
+	// --- clear any stale completion, wait for the engine to be idle ---
+	regWriteDmu(2, rInt, kAuxDoneAck);
+	for (int i = 0; i < 100 && (regReadDmu(2, rSts) & kAuxSwDone); i++)
+		IODelay(10);
+
+	// --- build the request buffer (submit_channel_request) ---
+	// header = 3 bytes (action+addr[19:0]); a data phase adds a length byte,
+	// and writes append the payload. AUX_SW_WR_BYTES counts them all.
+	// Command nibble bit 0 (byte bit 0x10) is the read flag: write actions
+	// (I2C_WRITE 0x00, I2C_WRITE_MOT 0x40, DP_WRITE 0x80) clear it; reads
+	// (I2C_READ 0x10, I2C_READ_MOT 0x50, DP_READ 0x90) set it.
+	const bool isWrite = (action & 0x10) == 0;
+	uint32_t length = len ? 4u : 3u;
+	if (isWrite) length += len;
+	regWriteDmu(2, rSwc,
+	            (regReadDmu(2, rSwc) & ~kAuxWrBytesMask) |
+	            ((length << kAuxWrBytesShift) & kAuxWrBytesMask));
+
+	// FIFO writes: INDEX=0, RW=0. The first byte latches index 0 with
+	// autoincrement disabled; clearing it for the rest advances the pointer.
+	uint32_t v = 0;
+	auto push = [&](bool first, uint8_t b) {
+		v &= ~(kAuxDataMask | kAuxAutoincDisable | kAuxDataRw);
+		v |= (static_cast<uint32_t>(b) << kAuxDataShift) & kAuxDataMask;
+		if (first) v |= kAuxAutoincDisable;
+		regWriteDmu(2, rDat, v);
+	};
+	push(true,  static_cast<uint8_t>(action | ((address >> 16) & 0x0f)));
+	push(false, static_cast<uint8_t>((address >> 8) & 0xff));
+	push(false, static_cast<uint8_t>(address & 0xff));
+	if (len) push(false, static_cast<uint8_t>(len - 1));
+	if (isWrite)
+		for (uint8_t i = 0; i < len; i++)
+			push(false, data ? data[i] : 0);
+
+	// --- go ---
+	regWriteDmu(2, rSwc, regReadDmu(2, rSwc) | kAuxSwGo);
+
+	// --- wait for completion (get_channel_status) ---
+	uint32_t sts = 0;
+	bool done = false;
+	for (int i = 0; i < 2000; i++) {   // ~20 ms ceiling; typically microseconds
+		sts = regReadDmu(2, rSts);
+		if (sts & kAuxSwDone) { done = true; break; }
+		IODelay(10);
+	}
+	if (!done || (sts & kAuxHpdDiscon) ||
+	    (sts & kAuxRxTimeout) || (sts & kAuxRxTimeoutState)) {
+		release();
+		return -1;
+	}
+
+	uint32_t nbytes = (sts & kAuxReplyCountMask) >> kAuxReplyCountShift;
+
+	// --- read the reply (read_channel_reply) ---
+	int replyCode = -1;
+	if (nbytes >= 1) {
+		// point the read cursor at byte 0; reads auto-advance from there
+		regWriteDmu(2, rDat, kAuxAutoincDisable | kAuxDataRw);  // INDEX=0, RW=1
+		uint32_t hdr = (regReadDmu(2, rDat) & kAuxDataMask) >> kAuxDataShift;
+		replyCode = (hdr >> 4) & 0x0f;           // first byte is the reply header
+		uint32_t dataBytes = nbytes - 1;
+		for (uint32_t i = 0; i < dataBytes; i++) {
+			uint32_t d = (regReadDmu(2, rDat) & kAuxDataMask) >> kAuxDataShift;
+			if (reply && i < replyCap) reply[i] = static_cast<uint8_t>(d);
+		}
+		if (replyBytes)
+			*replyBytes = static_cast<uint8_t>(dataBytes < replyCap ? dataBytes
+			                                                        : replyCap);
+	}
+
+	release();
+	return replyCode;
+}
+
+bool RX9070XTFB::readEDID(uint8_t inst, uint8_t *edid, size_t edidLen) {
+	uint8_t rb = 0;
+
+	// Point the sink's read pointer at offset 0 with an I2C write. MOT keeps
+	// the I2C START asserted across the reads that follow.
+	uint8_t offset = 0;
+	bool ok = false;
+	for (uint8_t t = 0; t < kAuxRetry; t++) {
+		int rc = auxTransaction(inst, kActI2CWriteMot, kDdcSlave, &offset, 1,
+		                        nullptr, 0, &rb);
+		if (rc == kReplyAck) { ok = true; break; }
+		if (rc < 0) return false;
+		if (rc == kReplyAuxDefer || rc == kReplyI2CDefer) { IODelay(500); continue; }
+		return false;  // NACK
+	}
+	if (!ok) return false;
+
+	// Sequential 16-byte I2C reads (the AUX data FIFO limit); drop MOT on the
+	// final chunk to issue the I2C STOP.
+	for (size_t pos = 0; pos < edidLen; ) {
+		uint8_t chunk = (edidLen - pos) > 16 ? 16 : static_cast<uint8_t>(edidLen - pos);
+		bool last = (pos + chunk) >= edidLen;
+		uint8_t act = last ? kActI2CRead : kActI2CReadMot;
+		bool got = false;
+		for (uint8_t t = 0; t < kAuxRetry; t++) {
+			int rc = auxTransaction(inst, act, kDdcSlave, nullptr, chunk,
+			                        edid + pos, chunk, &rb);
+			if (rc == kReplyAck) { got = true; break; }
+			if (rc < 0) return false;
+			if (rc == kReplyAuxDefer || rc == kReplyI2CDefer) { IODelay(500); continue; }
+			return false;
+		}
+		if (!got || rb == 0) return false;
+		pos += rb;  // advance by what the sink actually returned
+	}
+	return true;
+}
+
+void RX9070XTFB::probeEDID() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rx9070xt-edid", &on, sizeof(on)) || on == 0)
+		return;
+	if (!ipDiscovery.isValid() || !rmmio) {
+		FBLOG("edid: MMIO/discovery unavailable, skipping");
+		return;
+	}
+
+	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
+	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
+	bool any = false;
+	for (size_t i = 0; i < n; i++) {
+		AtomBios::ConnectorType ct =
+		    AtomBios::connectorType(paths[i].connectorObjId);
+		// Only DisplayPort/USB-C sinks carry DDC on the AUX channel; HDMI/DVI
+		// EDID travels over the separate I2C controller (not yet implemented).
+		if (ct != AtomBios::ConnectorDP && ct != AtomBios::ConnectorUSBC)
+			continue;
+
+		AtomBios::PathRecords rec {};
+		atomBios.getPathRecords(paths[i], rec);
+		uint8_t inst = rec.ddcLine;  // AUX engine index == DDC line on this board
+
+		uint8_t edid[128] {};
+		if (!readEDID(inst, edid, sizeof(edid))) {
+			FBLOG("edid: connector %zu (AUX%u): no reply", i, inst);
+			continue;
+		}
+
+		static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
+		if (memcmp(edid, sig, sizeof(sig)) != 0) {
+			FBLOG("edid: connector %zu (AUX%u): data but bad header "
+			      "%02x %02x %02x %02x", i, inst, edid[0], edid[1], edid[2], edid[3]);
+			continue;
+		}
+		any = true;
+
+		// Manufacturer id: bytes 8-9 big-endian, three 5-bit letters (1=A).
+		uint16_t m = static_cast<uint16_t>((edid[8] << 8) | edid[9]);
+		char mfg[4] = {
+			static_cast<char>('@' + ((m >> 10) & 0x1f)),
+			static_cast<char>('@' + ((m >> 5) & 0x1f)),
+			static_cast<char>('@' + (m & 0x1f)), 0 };
+		uint16_t product = static_cast<uint16_t>(edid[10] | (edid[11] << 8));
+		// Preferred timing = first 18-byte detailed descriptor (byte 54).
+		const uint8_t *d = edid + 54;
+		uint32_t hres = d[2] | ((static_cast<uint32_t>(d[4] & 0xf0)) << 4);
+		uint32_t vres = d[5] | ((static_cast<uint32_t>(d[7] & 0xf0)) << 4);
+		FBLOG("edid: connector %zu (AUX%u): %s product 0x%04x EDID %u.%u "
+		      "preferred %ux%u", i, inst, mfg, product, edid[18], edid[19],
+		      hres, vres);
+
+		char key[40];
+		snprintf(key, sizeof(key), "EDID,AUX%u", inst);
+		setProperty(key, edid, sizeof(edid));
+		snprintf(key, sizeof(key), "EDID,AUX%u-Vendor", inst);
+		setProperty(key, mfg);
+	}
+	if (!any)
+		FBLOG("edid: no DisplayPort EDID read (HDMI DDC over I2C not yet supported)");
+}
+
 bool RX9070XTFB::regWriteDmu(uint8_t baseIdx, uint32_t dwordOffset, uint32_t value) {
 	uint32_t byteOffset;
 	if (!ipDiscovery.isValid() ||
@@ -476,6 +749,7 @@ bool RX9070XTFB::start(IOService *provider) {
 		probeMemSize();
 		dumpDCN();
 		tryForce8bpc();
+		probeEDID();
 	}
 
 	if (!super::start(provider)) {
