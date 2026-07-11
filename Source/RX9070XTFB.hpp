@@ -141,6 +141,20 @@ class RX9070XTFB : public IOFramebuffer {
 	// plus one CTA extension if present. 0 length = no DDC sink found.
 	uint8_t edidData[256] {};
 	size_t  edidLen { 0 };
+	// AUX engine of the sink whose EDID we cached (the boot display) — the
+	// target for DPCD power writes.
+	uint8_t sinkAuxInst  { 0 };
+	bool    sinkAuxValid { false };
+
+	// Display power (DPMS). Off = disable the DP video stream (DP0, the boot
+	// pipe) and put the sink in D3 via a native-AUX DPCD SET_POWER write; on
+	// reverses both. Restores exactly the bits it cleared — DCN state, clocks
+	// and the timing generator are untouched, so this cannot lose the desktop
+	// short of full GPU power loss. "rx9070xt-nosleep=1" reverts to the old
+	// always-on behaviour.
+	bool displayPowerOn      { true };
+	bool displaySleepEnabled { true };
+	void setDisplayPower(bool on);
 
 public:
 	// IOService
@@ -173,6 +187,9 @@ public:
 
 	// IOFramebuffer — attributes / connection
 	IOReturn    getAttribute(IOSelect attribute, uintptr_t *value) override;
+	// Receives kIOPowerAttribute — IOFramebuffer's mechanism for asking the
+	// subclass to carry out a power state change (0 off, 1 doze, 2 on).
+	IOReturn    setAttribute(IOSelect attribute, uintptr_t value) override;
 	IOItemCount getConnectionCount() override;
 	IOReturn    getAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
 	                                      uintptr_t *value) override;

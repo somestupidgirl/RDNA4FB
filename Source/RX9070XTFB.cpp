@@ -164,7 +164,7 @@ void RX9070XTFB::publishVBIOSInfo() {
 		// e.g. "DisplayPort/ddc0/hpd1,DisplayPort/ddc1/hpd2,..."
 		char list[192] {};
 		for (size_t i = 0; i < n; i++) {
-			const char *name =
+			const char *conn =
 			    AtomBios::connectorName(AtomBios::connectorType(paths[i].connectorObjId));
 
 			AtomBios::PathRecords rec {};
@@ -172,11 +172,11 @@ void RX9070XTFB::publishVBIOSInfo() {
 
 			char entry[48];
 			snprintf(entry, sizeof(entry), "%s%s/ddc%u/hpd%u",
-			         i ? "," : "", name, rec.ddcLine, rec.hpdPin);
+			         i ? "," : "", conn, rec.ddcLine, rec.hpdPin);
 			strlcat(list, entry, sizeof(list));
 
 			FBLOG("connector %zu: %s objid=0x%04x encoder=0x%04x ddc-line=%u hpd-pin=%u", i,
-			      name, paths[i].connectorObjId, paths[i].encoderObjId, rec.ddcLine, rec.hpdPin);
+			      conn, paths[i].connectorObjId, paths[i].encoderObjId, rec.ddcLine, rec.hpdPin);
 		}
 		setProperty("AtomBIOS,Connectors", list);
 		setProperty("AtomBIOS,ConnectorCount", static_cast<uint64_t>(n), 32);
@@ -379,6 +379,7 @@ constexpr uint32_t kAuxAutoincDisable    = 1u << 31;  // AUX_SW_AUTOINCREMENT_DI
 constexpr uint8_t kActI2CWriteMot = 0x40;
 constexpr uint8_t kActI2CReadMot  = 0x50;
 constexpr uint8_t kActI2CRead     = 0x10;
+constexpr uint8_t kActDpWrite     = 0x80;  // native AUX (DPCD) write
 
 // AUX_REG_RW_CNTL_STATUS grant codes.
 constexpr uint32_t kSwCanAccess   = 1;
@@ -615,6 +616,8 @@ void RX9070XTFB::probeEDID() {
 		if (edidLen == 0) {
 			memcpy(edidData, edid, 128);
 			edidLen = 128;
+			sinkAuxInst = inst;
+			sinkAuxValid = true;
 			// One CTA extension block is the norm on EDID 1.4 sinks; fetch it
 			// so the OS sees the full timing/audio capabilities.
 			if (edid[126] > 0 &&
@@ -627,6 +630,57 @@ void RX9070XTFB::probeEDID() {
 	}
 	if (!any)
 		FBLOG("edid: no DisplayPort EDID read (HDMI DDC over I2C not yet supported)");
+}
+
+void RX9070XTFB::setDisplayPower(bool on) {
+	if (!displaySleepEnabled || on == displayPowerOn)
+		return;
+	if (!ipDiscovery.isValid() || !rmmio)
+		return;
+
+	// DP0 stream encoder — the boot pipe (dcn_4_1_0_offset.h, base_idx 2).
+	constexpr uint32_t kDpVidStreamCntl = 0x2122;
+	constexpr uint32_t kVidStreamEnable = 1u << 0;
+	// DPCD SET_POWER (native AUX address 0x600): D0 = 1, D3/sleep = 2.
+	constexpr uint32_t kDpcdSetPower = 0x600;
+
+	auto sinkPower = [&](uint8_t state) -> bool {
+		if (!sinkAuxValid)
+			return false;
+		// A sink coming out of D3 may need a moment before it ACKs AUX
+		// (DP spec allows up to 1 ms; be generous).
+		for (int t = 0; t < 10; t++) {
+			uint8_t rb = 0;
+			int rc = auxTransaction(sinkAuxInst, kActDpWrite, kDpcdSetPower,
+			                        &state, 1, nullptr, 0, &rb);
+			if (rc == kReplyAck)
+				return true;
+			IOSleep(1);
+		}
+		return false;
+	};
+
+	uint32_t v = regReadDmu(2, kDpVidStreamCntl);
+	if (v == 0xFFFFFFFF) {
+		FBLOG("power: stream register unreadable, leaving display alone");
+		return;
+	}
+
+	if (on) {
+		// Wake the sink first so it sees video the moment the stream returns.
+		bool acked = sinkPower(0x1);
+		regWriteDmu(2, kDpVidStreamCntl, v | kVidStreamEnable);
+		FBLOG("power: display on (sink D0 %s, stream 0x%08x -> 0x%08x)",
+		      acked ? "acked" : "no ack", v, regReadDmu(2, kDpVidStreamCntl));
+	} else {
+		// Blank the stream, then let the sink drop to D3. The timing
+		// generator keeps running; only the video stream enable is touched.
+		regWriteDmu(2, kDpVidStreamCntl, v & ~kVidStreamEnable);
+		bool acked = sinkPower(0x2);
+		FBLOG("power: display off (stream 0x%08x -> 0x%08x, sink D3 %s)",
+		      v, regReadDmu(2, kDpVidStreamCntl), acked ? "acked" : "no ack");
+	}
+	displayPowerOn = on;
 }
 
 bool RX9070XTFB::regWriteDmu(uint8_t baseIdx, uint32_t dwordOffset, uint32_t value) {
@@ -746,6 +800,12 @@ bool RX9070XTFB::start(IOService *provider) {
 	if (PE_parse_boot_argn("rx9070xt-cmap", &cmap, sizeof(cmap)) && cmap <= 5) {
 		channelMap = cmap;
 		FBLOG("start: using channel map %u", channelMap);
+	}
+
+	uint32_t nosleep = 0;
+	if (PE_parse_boot_argn("rx9070xt-nosleep", &nosleep, sizeof(nosleep)) && nosleep != 0) {
+		displaySleepEnabled = false;
+		FBLOG("start: display sleep disabled by rx9070xt-nosleep");
 	}
 
 	// Grab the bootloader-provided framebuffer before anything else touches it.
@@ -949,6 +1009,26 @@ IOReturn RX9070XTFB::getAttribute(IOSelect attribute, uintptr_t *value) {
 	}
 }
 
+IOReturn RX9070XTFB::setAttribute(IOSelect attribute, uintptr_t value) {
+	switch (attribute) {
+		case kIOPowerAttribute:
+			// IOFramebuffer asks the subclass to carry out its power state
+			// change here: 0 = off, 1 = doze, 2 = on. Doze and off both mean
+			// "stop showing pixels"; the framebuffer contents survive either
+			// way since we never power gate anything.
+			if (value >= 2) {
+				setDisplayPower(true);
+				handleEvent(kIOFBNotifyDidPowerOn);
+			} else {
+				handleEvent(kIOFBNotifyWillPowerOff);
+				setDisplayPower(false);
+			}
+			return kIOReturnSuccess;
+		default:
+			return super::setAttribute(attribute, value);
+	}
+}
+
 IOItemCount RX9070XTFB::getConnectionCount() {
 	return 1;
 }
@@ -978,7 +1058,9 @@ IOReturn RX9070XTFB::setAttributeForConnection(IOIndex connectIndex, IOSelect at
                                                uintptr_t value) {
 	switch (attribute) {
 		case kConnectionPower:
-			// We cannot change power; pretend success so the OS proceeds.
+			// Display-off path used by IODisplay (Energy Saver display
+			// sleep): 0 = off, nonzero = on.
+			setDisplayPower(value != 0);
 			return kIOReturnSuccess;
 		default:
 			return super::setAttributeForConnection(connectIndex, attribute, value);

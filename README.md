@@ -7,8 +7,8 @@ standalone IOKit kext against MacKernelSDK. Cross-compiles on Apple Silicon.
 **Status: working.** Verified on real hardware (Ryzen 9 5950X, Big Sur
 11.7.10): boots to a 4K desktop with correct colors, WindowServer composites
 on this framebuffer, and BAR5 register MMIO (read *and* write) is proven.
-Known v0 limitations: software cursor lags under load, display sleep is not
-implemented, and only the boot display lights up (single adopted scanout).
+Known v0 limitations: software cursor lags under load, and only the boot
+display lights up (single adopted scanout).
 
 > **Why not a Lilu plugin / OpenCore injection?** An `IOFramebuffer` subclass
 > must link against `com.apple.iokit.IOGraphicsFamily`, which on Big Sur+
@@ -65,6 +65,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rx9070xt-lutbypass=1` | Force the MPC MCM stages (shaper/3D LUT/1D LUT) to bypass on all pipes. |
 | `rx9070xt-8bpc=1` | Experiment: switch the active DP stream 10 bpc → 8 bpc and update the MSA to match (first proven live register write). |
 | `rx9070xt-noedid=1` | Skip the EDID-over-AUX probe (default on; verified on hardware 2026-07-11). Use if a sink misbehaves on DDC. |
+| `rx9070xt-nosleep=1` | Disable display sleep handling (power changes become no-ops again, screen stays on). Escape hatch if blank/unblank misbehaves. |
 
 ## Files
 
@@ -145,8 +146,12 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
    `enableController()` stops being a no-op. The register-offset workflow
    (Linux `dcn_4_1_0_offset.h` + IP discovery segment bases) is established
    from the color investigation.
-4. **Display power management** — blank/unblank scanout for display sleep;
-   register proper IOFramebuffer power states.
+4. **Display power management** *(implemented, awaiting hardware verify)* —
+   on `kIOPowerAttribute`/`kConnectionPower` changes the driver disables the
+   DP video stream (`DP_VID_STREAM_CNTL`) and puts the sink in D3 via a
+   native-AUX DPCD `SET_POWER` write, reversing both on wake. The timing
+   generator and clocks are untouched, so wake restores exactly the firmware
+   state. Opt out with `rx9070xt-nosleep=1`.
 5. **Power / clocks** — SMU firmware handshake so the card is stable, not
    stuck at boot clocks.
 6. **Acceleration (huge)** — a real accelerator: GFX12 command processor, ring
@@ -173,6 +178,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
 - [x] Kill-switch boot-arg (`rx9070xt-off=1`) for safe iteration
 - [x] DP AUX software engine + EDID read over I2C-over-AUX (verified on
       hardware: Samsung 4K sink on AUX0), served via `getDDCBlock()`
+- [ ] Display sleep (implemented: stream blank + sink D3 over native AUX;
+      needs hardware verification)
 - [ ] Native mode setting (DCN 4.1.0) / multiple displays
-- [ ] Display sleep / power management
 - [ ] Acceleration / Metal
