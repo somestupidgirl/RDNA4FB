@@ -28,6 +28,7 @@ constexpr uint32_t kCmdSize = 64;   // every ring entry, header included
 // enum dmub_cmd_type (stable ABI per the header)
 constexpr uint8_t CmdNull             = 0;
 constexpr uint8_t CmdQueryFeatureCaps = 6;    // harmless: FW reports caps
+constexpr uint8_t CmdUpdateCursorInfo = 68;   // PSR cursor mirror: FW programs cursor regs
 constexpr uint8_t CmdVbios            = 128;  // "VBIOS" services in FW
 
 // enum dmub_cmd_vbios_type

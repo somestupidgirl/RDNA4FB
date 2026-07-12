@@ -145,6 +145,11 @@ class RDNA4FB : public IOFramebuffer {
 	// for transmitter control / pixel clock — the keystone of second-pipe
 	// mode setting — is drivable from this kext.
 	void dmubPing();
+	// Boot-arg "rdna4-dmubcursor=1" (requires rdna4-hwcursor=1): send our
+	// cursor register images to the firmware via DMUB_CMD__UPDATE_CURSOR_INFO
+	// and let IT program the cursor plane — the flanking move after direct
+	// register programming was exhausted.
+	void dmubCursorTest();
 	// Indirect VRAM dword access via MM_INDEX/MM_DATA (any VRAM address,
 	// no ReBAR needed) — amdgpu_device_mm_access.
 	uint32_t vramRead32(uint64_t pos);

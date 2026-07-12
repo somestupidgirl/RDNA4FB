@@ -1010,6 +1010,99 @@ void RDNA4FB::dmubPing() {
 		      newWptr, nrptr);
 }
 
+// rdna4-dmubcursor=1: the flanking move for the invisible-cursor saga —
+// hand the firmware our cursor register images via DMUB_CMD__UPDATE_CURSOR_
+// INFO (two chained ring entries, dc_send_update_cursor_info_to_dmu) and let
+// IT program the hardware. A white 64x64 square appearing at (100,100)
+// means AMD's own code can light the cursor plane where nine rounds of
+// direct programming could not; nothing appearing is decisive the other way.
+// Note: the DMUB position layout is x[15:0], y[31:16] — the OPPOSITE of the
+// dcn_4_1_0_sh_mask claim; whichever the FW writes is the silicon truth.
+void RDNA4FB::dmubCursorTest() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-dmubcursor", &on, sizeof(on)) || on == 0)
+		return;
+	if (!hwCursorReady || !cursorVram) {
+		FBLOG("dmub: cursor test needs rdna4-hwcursor=1 (sprite slot)");
+		return;
+	}
+
+	// Opaque white 64x64 sprite in the (128-pixel-pitch) slot.
+	for (uint32_t i = 0; i < 128 * 128; i++)
+		cursorVram[i] = 0;
+	for (uint32_t r = 0; r < 64; r++)
+		for (uint32_t c = 0; c < 64; c++)
+			cursorVram[r * 128 + c] = 0xFFFFFFFFu;
+
+	constexpr uint32_t kInbox1Size = 0x01d5;
+	constexpr uint32_t kInbox1Wptr = 0x01d6, kInbox1Rptr = 0x01d7;
+	uint32_t inboxSize = regReadDmu(2, kInbox1Size);
+	uint32_t wptr = regReadDmu(2, kInbox1Wptr);
+	uint32_t rptr = regReadDmu(2, kInbox1Rptr);
+	if (inboxSize == 0 || inboxSize > 0x100000 || wptr != rptr) {
+		FBLOG("dmub: inbox busy, skipping cursor test");
+		return;
+	}
+	uint64_t region4Mc = regReadDmu(2, 0x0196) |
+	    (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32);
+	uint64_t vramMcBase =
+	    static_cast<uint64_t>(regReadDmu(2, 0x0475) & 0xffffff) << 24;
+	uint64_t ringBase = region4Mc - vramMcBase;
+
+	// HUBP cursor control image in the DMUB union layout (enable, mode[10:8],
+	// pitch[17:16], lines_per_chunk[28:24]; REQ_MODE is not ours to set here).
+	const uint32_t hubpCtl = 1u | (hwCursorMode << 8) |
+	                         (1u << 16) /*pitch 128px*/ | (3u << 24);
+	const uint32_t dppCtl  = 1u | (hwCursorMode << 4);
+
+	uint32_t cmd0[16] = {
+		Dmub::headerWord(Dmub::CmdUpdateCursorInfo, 0, 52, false, /*multi=*/true),
+		100, 100, 64, 64,          // cursor_rect x,y,w,h
+		0,                         // debug flags
+		0x00000001,                // enable=1, pipe 0, version 0, panel 0
+		hubpCtl,
+		100u | (100u << 16),       // position: x [15:0], y [31:16] per DMUB
+		0,                         // hot spot
+		0,                         // dst offset
+		dppCtl,
+		0,                         // position pipe_idx + padding
+		0,                         // otg_inst + padding
+		0, 0,
+	};
+	uint32_t cmd1[16] = {
+		Dmub::headerWord(Dmub::CmdUpdateCursorInfo, 0, 24),
+		static_cast<uint32_t>(cursorMcAddr >> 32) & 0xffff,   // SURFACE_ADDR_HIGH
+		static_cast<uint32_t>(cursorMcAddr),                  // SURFACE_ADDR
+		hubpCtl,
+		64u | (64u << 16),         // size: width, height
+		3u << 8,                   // settings: chunk_hdl_adjust
+		dppCtl,
+		0, 0, 0, 0, 0, 0, 0, 0, 0,
+	};
+
+	for (uint32_t i = 0; i < 16; i++)
+		vramWrite32(ringBase + wptr + 4 * i, cmd0[i]);
+	uint32_t slot1 = (wptr + Dmub::kCmdSize) % inboxSize;
+	for (uint32_t i = 0; i < 16; i++)
+		vramWrite32(ringBase + slot1 + 4 * i, cmd1[i]);
+
+	uint32_t newWptr = (wptr + 2 * Dmub::kCmdSize) % inboxSize;
+	regWriteDmu(2, kInbox1Wptr, newWptr);
+
+	uint32_t nrptr = rptr;
+	for (int i = 0; i < 20000; i++) {
+		nrptr = regReadDmu(2, kInbox1Rptr);
+		if (nrptr == newWptr)
+			break;
+		IODelay(10);
+	}
+	FBLOG("dmub: cursor-info %s (rptr 0x%x -> 0x%x); look for a white 64x64 "
+	      "square at (100,100); hubp ctl rb=0x%08x pos rb=0x%08x cm rb=0x%08x",
+	      nrptr == newWptr ? "CONSUMED" : "NOT consumed", rptr, nrptr,
+	      regReadDmu(2, 0x0679), regReadDmu(2, 0x067d),
+	      regReadDmu(2, 0x0cf1));
+}
+
 void RDNA4FB::setDisplayPower(bool on) {
 	if (!displaySleepEnabled || on == displayPowerOn)
 		return;
@@ -1666,6 +1759,7 @@ bool RDNA4FB::start(IOService *provider) {
 		dumpModeState();
 		initHWCursor();
 		dmubPing();
+		dmubCursorTest();
 	}
 
 	if (!super::start(provider)) {
