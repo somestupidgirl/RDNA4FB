@@ -1065,6 +1065,17 @@ constexpr uint32_t kCmCur0FpScaleBiasGY = 0x0cf4;  // SCALE [15:0], BIAS [31:16]
 constexpr uint32_t kCmCur0FpScaleBiasRB = 0x0cf5;
 constexpr uint32_t kCmCur0MatrixMode    = 0x0cf6;
 constexpr uint32_t kCurFpScaleOne       = 0x3c00;  // FP16 1.0
+// Pipe update latching. Cursor/CM registers are double-buffered: writes go
+// to a pending copy that latches into live hardware at the frame boundary —
+// but only while OTG_MASTER_UPDATE_LOCK is released. The GOP programs its
+// pipe under the lock and has no reason to ever release it, which freezes
+// every later pipe update in pending space (reads return the pending values,
+// so all writes "verify" while the hardware never changes). LOCK bit 0 is
+// the request; UPDATE_LOCK_STATUS bit 8 and OTG_UPDATE_PENDING bit 0 of
+// DOUBLE_BUFFER_CONTROL are true status bits.
+constexpr uint32_t kOtgMasterUpdateLock  = 0x1b89;
+constexpr uint32_t kOtgDoubleBufferCtl   = 0x1b5c;
+constexpr uint32_t kDppTopControl        = 0x0cc5;
 // HUBPREQ0_CURSOR_SETTINGS — cursor fetch scheduling. amdgpu always programs
 // CHUNK_HDL_ADJUST=3 ([9:8]); without it and a correct LINES_PER_CHUNK the
 // cursor request pipeline can fetch nothing (sprite armed but invisible).
@@ -1146,6 +1157,19 @@ bool RDNA4FB::initHWCursor() {
 		cursorMap = nullptr;
 		cursorVram = nullptr;
 		return false;
+	}
+
+	// Release the OTG master update lock if the GOP left it held: with the
+	// lock asserted, every double-buffered cursor/CM write stays pending
+	// forever (writes read back fine, hardware never changes).
+	uint32_t lock = regReadDmu(2, kOtgMasterUpdateLock);
+	uint32_t dbc  = regReadDmu(2, kOtgDoubleBufferCtl);
+	FBLOG("cursor: OTG lock=0x%08x (status=%u) dbufctl=0x%08x dppctl=0x%08x",
+	      lock, (lock >> 8) & 1, dbc, regReadDmu(2, kDppTopControl));
+	if (lock & 1) {
+		regWriteDmu(2, kOtgMasterUpdateLock, 0);
+		FBLOG("cursor: released OTG master update lock (was 0x%08x, now 0x%08x)",
+		      lock, regReadDmu(2, kOtgMasterUpdateLock));
 	}
 
 	FBLOG("cursor: HW cursor armed: scanout MC 0x%llx, sprite MC 0x%llx "
@@ -1265,11 +1289,17 @@ IOReturn RDNA4FB::setCursorState(SInt32 x, SInt32 y, bool visible) {
 	            (hwCursorMode << kCur0ModeShift) | (visible ? 1u : 0u));
 	hwCursorVisible = visible;
 
-	if (cursorPosLogs < 3) {
+	if (cursorPosLogs < 6) {
 		cursorPosLogs++;
-		FBLOG("cursor: state x=%d y=%d vis=%d rb: pos=0x%08x ctl=0x%08x",
+		// cm bit16 is CUR0_UPDATE_PENDING (true status): stuck at 1 means
+		// pipe updates are not latching; it must read 0 within a frame.
+		FBLOG("cursor: state x=%d y=%d vis=%d rb: pos=0x%08x ctl=0x%08x "
+		      "cm=0x%08x lock=0x%08x pend=%u",
 		      (int)x, (int)y, visible,
-		      regReadDmu(2, kCurPosition), regReadDmu(2, kCurControl));
+		      regReadDmu(2, kCurPosition), regReadDmu(2, kCurControl),
+		      regReadDmu(2, kCmCur0Control),
+		      regReadDmu(2, kOtgMasterUpdateLock),
+		      regReadDmu(2, kOtgDoubleBufferCtl) & 1);
 	}
 	return kIOReturnSuccess;
 }
