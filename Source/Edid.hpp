@@ -49,6 +49,29 @@ bool parseDetailedTiming(const uint8_t d[18], DetailedTiming &out);
 // the block header first.
 bool preferredTiming(const uint8_t *edid, size_t len, DetailedTiming &out);
 
+// --- CTA-861 extension block ------------------------------------------------
+// Sink capabilities needed to pick a legal signal for mode setting: pixel
+// repertoire (short video descriptors), color format support, and — for HDMI
+// sinks — the maximum TMDS character clock from the HDMI VSDB.
+
+struct CtaCaps {
+	uint8_t  revision   { 0 };
+	bool     underscan  { false };
+	bool     basicAudio { false };
+	bool     ycbcr444   { false };
+	bool     ycbcr422   { false };
+	uint8_t  vics[32]   {};     // short video descriptors (VIC codes, bit7 cleared)
+	size_t   vicCount   { 0 };
+	bool     hasHdmiVsdb { false };  // IEEE OUI 00-0C-03 vendor block present
+	uint32_t maxTmdsKHz { 0 };       // 0 = not advertised
+	size_t   dtdCount   { 0 };       // additional 18-byte timings in the block
+	DetailedTiming firstDtd {};      // valid when dtdCount > 0
+};
+
+// Parse one 128-byte CTA-861 extension (tag 0x02). Returns false if the tag
+// or structure is invalid.
+bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out);
+
 } // namespace Edid
 
 #endif /* Edid_hpp */

@@ -30,7 +30,8 @@ CXX_SRCS := \
 	Source/RX9070XTFB.cpp \
 	Source/AtomBios.cpp \
 	Source/IpDiscovery.cpp \
-	Source/Edid.cpp
+	Source/Edid.cpp \
+	Source/OtgTiming.cpp
 
 C_SRCS := \
 	Source/kmod_info.c
@@ -72,9 +73,9 @@ FIRMWARE := firmware/Sapphire.RX9070XT.16384.241213.rom
 .PHONY: all clean test
 all: $(KEXT)
 
-$(ATOMDUMP): tools/atomdump.cpp Source/AtomBios.cpp Source/AtomBios.hpp Source/IpDiscovery.cpp Source/IpDiscovery.hpp Source/Edid.cpp Source/Edid.hpp
+$(ATOMDUMP): tools/atomdump.cpp Source/AtomBios.cpp Source/AtomBios.hpp Source/IpDiscovery.cpp Source/IpDiscovery.hpp Source/Edid.cpp Source/Edid.hpp Source/OtgTiming.cpp Source/OtgTiming.hpp
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp Source/AtomBios.cpp Source/IpDiscovery.cpp Source/Edid.cpp
+	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp Source/AtomBios.cpp Source/IpDiscovery.cpp Source/Edid.cpp Source/OtgTiming.cpp
 
 atomdump: $(ATOMDUMP)
 

@@ -16,20 +16,25 @@
 #include "../Source/AtomBios.hpp"
 #include "../Source/IpDiscovery.hpp"
 #include "../Source/Edid.hpp"
+#include "../Source/OtgTiming.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 
-// The Samsung LS27DG702 (Odyssey G70D) EDID base block captured from the
-// live system's IODisplayEDID (2026-07-11) — fixture for the DTD parser the
-// kext uses to turn an EDID into OTG timing parameters.
+// The Samsung LS27DG702 (Odyssey G70D) full 256-byte EDID (base + CTA-861
+// extension) captured from the live system's IODisplayEDID (2026-07-11) —
+// fixture for the DTD/CTA parsers and the OTG timing computation.
 static const char kSamsungEdidHex[] =
 	"00ffffffffffff004c2d6fe0000000000e220104b53c22783b32b5ad5045a125"
 	"0e505421880081c0810081809500a9c0b300010101014dd000a0f0703e803020"
 	"3500ba882100001a000000fd0c309045458f010a202020202020000000fc004f"
-	"64797373657920473730440a000000ff004831414b3530303030300a2020027a";
+	"64797373657920473730440a000000ff004831414b3530303030300a2020027a"
+	"02033af04761103f04035f762309070783010000e305c301741a0000030f3090"
+	"000060085b3690000000000000e6060501605b00e5018b84903d565e00a0a0a0"
+	"295030203500ba882100001a6fc200a0a0a0555030203500ba882100001a0474"
+	"801871382d40582c4500ba882100001e00000000000000000000000000000005";
 
 static bool hexToBytes(const char *hex, uint8_t *out, size_t outLen) {
 	for (size_t i = 0; i < outLen; i++) {
@@ -44,7 +49,7 @@ static bool hexToBytes(const char *hex, uint8_t *out, size_t outLen) {
 // Verify the EDID DTD parser against the known 4K60 preferred timing.
 static int testEdidParser() {
 	int failures = 0;
-	uint8_t edid[128];
+	uint8_t edid[256];
 	if (!hexToBytes(kSamsungEdidHex, edid, sizeof(edid))) {
 		fprintf(stderr, "FAIL: EDID fixture is malformed\n");
 		return 1;
@@ -85,6 +90,72 @@ static int testEdidParser() {
 	// 533250000 / (4000*2222) = 59.99 Hz
 	if (t.refreshMilliHz() / 100 != 599) {
 		fprintf(stderr, "FAIL: refresh %u mHz, expected ~59.99 Hz\n", t.refreshMilliHz());
+		failures++;
+	}
+
+	// OTG register images per optc1_program_timing. These exact raw values
+	// must appear in the OTG0 line of a rx9070xt-modedump log (the GOP
+	// programmed the same timing) — hardware validation of the math before
+	// any OTG is written by us.
+	OtgTiming::Regs r {};
+	if (!OtgTiming::compute(t, r)) {
+		fprintf(stderr, "FAIL: OTG computation rejected the 4K60 timing\n");
+		return failures + 1;
+	}
+	printf("  expected OTG0 (diff vs modedump): h_total=0x%08x h_blank=0x%08x "
+	       "h_sync=0x%08x\n                                    v_total=0x%08x "
+	       "v_blank=0x%08x v_sync=0x%08x\n",
+	       r.hTotal, r.hBlankStartEnd, r.hSyncA, r.vTotal, r.vBlankStartEnd, r.vSyncA);
+	struct { const char *name; uint32_t got, want; } otgChecks[] = {
+		{ "OTG_H_TOTAL",           r.hTotal,         3999 },
+		{ "OTG_H_SYNC_A",          r.hSyncA,         32u << 16 },
+		{ "OTG_H_BLANK_START_END", r.hBlankStartEnd, 3952u | (112u << 16) },
+		{ "OTG_V_TOTAL",           r.vTotal,         2221 },
+		{ "OTG_V_SYNC_A",          r.vSyncA,         5u << 16 },
+		{ "OTG_V_BLANK_START_END", r.vBlankStartEnd, 2219u | (59u << 16) },
+	};
+	for (auto &c : otgChecks) {
+		if (c.got != c.want) {
+			fprintf(stderr, "FAIL: %s = 0x%08x, expected 0x%08x\n", c.name, c.got, c.want);
+			failures++;
+		}
+	}
+	if (r.hSyncPolInvert != false || r.vSyncPolInvert != true) {
+		fprintf(stderr, "FAIL: sync polarity inversion (h=%d v=%d), expected h=0 v=1\n",
+		        r.hSyncPolInvert, r.vSyncPolInvert);
+		failures++;
+	}
+
+	// CTA-861 extension: capabilities the HDMI mode-set must respect.
+	Edid::CtaCaps cta {};
+	if (!Edid::parseCtaBlock(edid + 128, cta)) {
+		fprintf(stderr, "FAIL: CTA extension did not parse\n");
+		return failures + 1;
+	}
+	printf("  cta: rev %u underscan=%d audio=%d ycbcr444=%d ycbcr422=%d "
+	       "vics=%zu hdmi_vsdb=%d max_tmds=%ukHz dtds=%zu\n",
+	       cta.revision, cta.underscan, cta.basicAudio, cta.ycbcr444,
+	       cta.ycbcr422, cta.vicCount, cta.hasHdmiVsdb, cta.maxTmdsKHz,
+	       cta.dtdCount);
+	if (cta.dtdCount)
+		printf("  cta first dtd: %ux%u pclk=%ukHz\n",
+		       cta.firstDtd.hActive, cta.firstDtd.vActive, cta.firstDtd.pixelClockKHz);
+	if (cta.revision != 3 || !cta.basicAudio || !cta.ycbcr444 || !cta.ycbcr422) {
+		fprintf(stderr, "FAIL: CTA flags/revision mismatch\n");
+		failures++;
+	}
+	bool has4k60 = false, has1080p60 = false;
+	for (size_t i = 0; i < cta.vicCount; i++) {
+		if (cta.vics[i] == 97) has4k60 = true;    // 3840x2160p60
+		if (cta.vics[i] == 16) has1080p60 = true; // 1920x1080p60
+	}
+	if (!has4k60 || !has1080p60) {
+		fprintf(stderr, "FAIL: expected VICs 97 and 16 in the video block\n");
+		failures++;
+	}
+	// This is a DisplayPort sink: no HDMI LLC vendor block expected.
+	if (cta.hasHdmiVsdb) {
+		fprintf(stderr, "FAIL: unexpected HDMI VSDB on a DP sink\n");
 		failures++;
 	}
 	return failures;

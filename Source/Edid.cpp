@@ -50,4 +50,54 @@ bool preferredTiming(const uint8_t *edid, size_t len, DetailedTiming &out) {
 	return parseDetailedTiming(edid + 54, out);
 }
 
+bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
+	if (!ext || ext[0] != 0x02)
+		return false;
+	out = CtaCaps {};
+	out.revision   = ext[1];
+	uint8_t dtdOff = ext[2];          // 0 = no DTDs and no data blocks
+	out.underscan  = (ext[3] & 0x80) != 0;
+	out.basicAudio = (ext[3] & 0x40) != 0;
+	out.ycbcr444   = (ext[3] & 0x20) != 0;
+	out.ycbcr422   = (ext[3] & 0x10) != 0;
+
+	// Data block collection: [4, dtdOff). Each block: tag [7:5], length [4:0].
+	if (out.revision >= 3 && dtdOff >= 4) {
+		size_t pos = 4;
+		size_t end = dtdOff < 128 ? dtdOff : 127;
+		while (pos < end) {
+			uint8_t tag = ext[pos] >> 5;
+			uint8_t len = ext[pos] & 0x1f;
+			if (pos + 1 + len > end)
+				break;
+			const uint8_t *p = ext + pos + 1;
+			if (tag == 2) {                     // video block: SVDs
+				for (uint8_t i = 0; i < len && out.vicCount < 32; i++)
+					out.vics[out.vicCount++] = p[i] & 0x7f;
+			} else if (tag == 3 && len >= 5 &&  // vendor block, HDMI LLC OUI
+			           p[0] == 0x03 && p[1] == 0x0c && p[2] == 0x00) {
+				out.hasHdmiVsdb = true;
+				if (len >= 7 && p[6])
+					out.maxTmdsKHz = static_cast<uint32_t>(p[6]) * 5000;
+			}
+			pos += 1u + len;
+		}
+	}
+
+	// 18-byte detailed timings from dtdOff to the checksum byte.
+	if (dtdOff >= 4) {
+		size_t pos = dtdOff;
+		while (pos + 18 <= 127) {
+			DetailedTiming t {};
+			if (!parseDetailedTiming(ext + pos, t))
+				break;
+			if (out.dtdCount == 0)
+				out.firstDtd = t;
+			out.dtdCount++;
+			pos += 18;
+		}
+	}
+	return true;
+}
+
 } // namespace Edid
