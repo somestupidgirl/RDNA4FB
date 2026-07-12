@@ -965,6 +965,83 @@ void RX9070XTFB::setDisplayPower(bool on) {
 }
 
 // ---------------------------------------------------------------------------
+// Emulated VBL interrupt
+// ---------------------------------------------------------------------------
+
+void RX9070XTFB::fireVBL(IOTimerEventSource *sender) {
+	if (vblProc && vblEnabled)
+		vblProc(vblTarget, vblRef);
+	if (sender && vblEnabled)
+		sender->setTimeoutUS(vblPeriodUS);
+}
+
+IOReturn RX9070XTFB::registerForInterruptType(IOSelect interruptType,
+                                              IOFBInterruptProc proc,
+                                              OSObject *target, void *ref,
+                                              void **interruptRef) {
+	if (interruptType != kIOFBVBLInterruptType || !vblRequested || !proc)
+		return super::registerForInterruptType(interruptType, proc, target,
+		                                       ref, interruptRef);
+
+	// Refine the tick period from the sink's EDID (59.996 Hz on the boot
+	// display reads as 16668 us; default stays 60 Hz).
+	Edid::DetailedTiming t {};
+	if (edidLen && Edid::preferredTiming(edidData, edidLen, t) &&
+	    t.refreshMilliHz() >= 30000 && t.refreshMilliHz() <= 240000)
+		vblPeriodUS = 1000000000u / t.refreshMilliHz();
+
+	vblProc = proc;
+	vblTarget = target;
+	vblRef = ref;
+
+	if (!vblTimer) {
+		vblTimer = IOTimerEventSource::timerEventSource(this,
+		    OSMemberFunctionCast(IOTimerEventSource::Action, this,
+		                         &RX9070XTFB::fireVBL));
+		if (!vblTimer || !getWorkLoop() ||
+		    getWorkLoop()->addEventSource(vblTimer) != kIOReturnSuccess) {
+			if (vblTimer) {
+				vblTimer->release();
+				vblTimer = nullptr;
+			}
+			vblProc = nullptr;
+			return kIOReturnUnsupported;
+		}
+	}
+
+	vblEnabled = true;
+	vblTimer->setTimeoutUS(vblPeriodUS);
+	FBLOG("vbl: emulated VBL armed, period %u us", vblPeriodUS);
+	if (interruptRef)
+		*interruptRef = &vblProc;   // opaque token identifying our VBL slot
+	return kIOReturnSuccess;
+}
+
+IOReturn RX9070XTFB::unregisterInterrupt(void *interruptRef) {
+	if (interruptRef != &vblProc)
+		return super::unregisterInterrupt(interruptRef);
+	vblEnabled = false;
+	if (vblTimer)
+		vblTimer->cancelTimeout();
+	vblProc = nullptr;
+	return kIOReturnSuccess;
+}
+
+IOReturn RX9070XTFB::setInterruptState(void *interruptRef, UInt32 state) {
+	if (interruptRef != &vblProc)
+		return super::setInterruptState(interruptRef, state);
+	// IOFramebuffer throttles VBL when idle (vblThrottle) and re-enables it
+	// on demand; honoring the state keeps the timer from ticking pointlessly.
+	bool enable = (state == kEnabledInterruptState);
+	if (enable && !vblEnabled && vblTimer)
+		vblTimer->setTimeoutUS(vblPeriodUS);
+	if (!enable && vblTimer)
+		vblTimer->cancelTimeout();
+	vblEnabled = enable;
+	return kIOReturnSuccess;
+}
+
+// ---------------------------------------------------------------------------
 // Hardware cursor (DCN cursor plane, pipe 0)
 // ---------------------------------------------------------------------------
 
@@ -1272,6 +1349,10 @@ bool RX9070XTFB::start(IOService *provider) {
 		FBLOG("start: display sleep disabled by rx9070xt-nosleep");
 	}
 
+	uint32_t vbl = 0;
+	if (PE_parse_boot_argn("rx9070xt-vbl", &vbl, sizeof(vbl)) && vbl != 0)
+		vblRequested = true;
+
 	uint32_t hwcur = 0;
 	if (PE_parse_boot_argn("rx9070xt-hwcursor", &hwcur, sizeof(hwcur)) && hwcur != 0) {
 		hwCursorRequested = true;
@@ -1316,6 +1397,15 @@ bool RX9070XTFB::start(IOService *provider) {
 
 void RX9070XTFB::stop(IOService *provider) {
 	FBLOG("stop");
+	vblEnabled = false;
+	vblProc = nullptr;
+	if (vblTimer) {
+		vblTimer->cancelTimeout();
+		if (getWorkLoop())
+			getWorkLoop()->removeEventSource(vblTimer);
+		vblTimer->release();
+		vblTimer = nullptr;
+	}
 	hwCursorReady = false;
 	if (cursorStage) {
 		IOFree(cursorStage, kCursorBytes);

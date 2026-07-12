@@ -22,6 +22,7 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <pexpert/pexpert.h>
 
 #include "AtomBios.hpp"
@@ -198,6 +199,22 @@ class RX9070XTFB : public IOFramebuffer {
 	uint32_t *cursorStage { nullptr };  // convertCursorImage staging buffer
 	uint64_t  cursorMcAddr { 0 };       // GPU (MC) address of the sprite
 
+	// Emulated vertical-blank "interrupt" (rx9070xt-vbl=1). IOFramebuffer
+	// only engages its frame-pacing machinery (CVDisplayLink timestamps,
+	// deferred cursor moves, vbl throttling) if the subclass provides VBL
+	// service via registerForInterruptType — which we cannot do from real
+	// hardware without an IH-ring interrupt handler. A workloop timer at the
+	// EDID refresh period is the standard substitute for a scanout-less
+	// driver and gives WindowServer a steady heartbeat to pace against.
+	bool               vblRequested { false };
+	IOFBInterruptProc  vblProc   { nullptr };
+	OSObject          *vblTarget { nullptr };
+	void              *vblRef    { nullptr };
+	IOTimerEventSource *vblTimer { nullptr };
+	uint32_t           vblPeriodUS { 16667 };  // refined from the sink's EDID
+	bool               vblEnabled { false };
+	void fireVBL(IOTimerEventSource *sender);
+
 public:
 	// IOService
 	IOService *probe(IOService *provider, SInt32 *score) override;
@@ -248,6 +265,13 @@ public:
 	// IOFramebuffer — hardware cursor
 	IOReturn setCursorImage(void *cursorImage) override;
 	IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) override;
+
+	// IOFramebuffer — interrupts (timer-emulated VBL)
+	IOReturn registerForInterruptType(IOSelect interruptType,
+	                                  IOFBInterruptProc proc, OSObject *target,
+	                                  void *ref, void **interruptRef) override;
+	IOReturn unregisterInterrupt(void *interruptRef) override;
+	IOReturn setInterruptState(void *interruptRef, UInt32 state) override;
 
 	// Report that this framebuffer's console is already usable so IOGraphics
 	// does not attempt to reprogram hardware we cannot drive.
