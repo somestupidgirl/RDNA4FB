@@ -1054,6 +1054,7 @@ constexpr uint32_t kCurAddrHigh = 0x067b;
 constexpr uint32_t kCurSize     = 0x067c;
 constexpr uint32_t kCurPosition = 0x067d;
 constexpr uint32_t kCurHotSpot  = 0x067e;
+constexpr uint32_t kCurDstOffset = 0x0680;
 constexpr uint32_t kCmCur0Control = 0x0cf1;
 // HUBPREQ0_CURSOR_SETTINGS — cursor fetch scheduling. amdgpu always programs
 // CHUNK_HDL_ADJUST=3 ([9:8]); without it and a correct LINES_PER_CHUNK the
@@ -1169,6 +1170,28 @@ IOReturn RDNA4FB::setCursorImage(void *cursorImage) {
 		for (uint32_t col = 0; col < w; col++)
 			cursorVram[row * kCursorPixels + col] = cursorStage[row * w + col];
 
+	// Data-integrity check for the first images: find an opaque staging
+	// pixel and read the same location back from VRAM. Registers verifying
+	// while the pointer stays invisible means either the conversion made a
+	// fully transparent sprite (staging max-alpha 0) or the CPU->VRAM window
+	// is not where we think (VRAM readback mismatch).
+	if (cursorImgLogs < 3) {
+		uint32_t opaqueIdx = 0, opaqueVal = 0;
+		for (uint32_t i = 0; i < w * h; i++) {
+			if ((cursorStage[i] >> 24) > (opaqueVal >> 24)) {
+				opaqueVal = cursorStage[i];
+				opaqueIdx = i;
+			}
+			if ((opaqueVal >> 24) == 0xff)
+				break;
+		}
+		uint32_t row = opaqueIdx / w, col = opaqueIdx % w;
+		uint32_t vramVal = cursorVram[row * kCursorPixels + col];
+		FBLOG("cursor: pixel check: stage[%u,%u]=0x%08x vram=0x%08x %s",
+		      col, row, opaqueVal, vramVal,
+		      opaqueVal == vramVal ? "(match)" : "(MISMATCH - aperture wrong)");
+	}
+
 	regWriteDmu(2, kCurAddrHigh, static_cast<uint32_t>(cursorMcAddr >> 32) & 0xffff);
 	regWriteDmu(2, kCurAddr, static_cast<uint32_t>(cursorMcAddr));
 	regWriteDmu(2, kCurSize, h | (w << 16));
@@ -1208,6 +1231,11 @@ IOReturn RDNA4FB::setCursorState(SInt32 x, SInt32 y, bool visible) {
 	regWriteDmu(2, kCurPosition,
 	            (static_cast<uint32_t>(y) & 0x7fff) |
 	            (static_cast<uint32_t>(x) << kCurXShift));
+	// Cursor fetch deadline (hubp2_cursor_set_position): the source x offset
+	// scaled from pixel time to refclk time. 100 MHz refclk over the 533.25
+	// MHz boot pixel clock; precision is uncritical (it is a deadline hint).
+	regWriteDmu(2, kCurDstOffset,
+	            (static_cast<uint32_t>(x) * 100000u) / 533250u);
 	if (cursorCtlBase)   // 0 until the first setCursorImage
 		regWriteDmu(2, kCurControl, cursorCtlBase | (visible ? 1u : 0u));
 	regWriteDmu(2, kCmCur0Control,
