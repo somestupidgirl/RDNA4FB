@@ -145,6 +145,10 @@ class RDNA4FB : public IOFramebuffer {
 	// for transmitter control / pixel clock — the keystone of second-pipe
 	// mode setting — is drivable from this kext.
 	void dmubPing();
+	// Indirect VRAM dword access via MM_INDEX/MM_DATA (any VRAM address,
+	// no ReBAR needed) — amdgpu_device_mm_access.
+	uint32_t vramRead32(uint64_t pos);
+	void     vramWrite32(uint64_t pos, uint32_t value);
 	// Boot-arg "rdna4-modedump=1": read-only survey of the mode-setting
 	// register landscape — every OTG's timing/enable state, every DIG
 	// front/back-end, the HUBP surface addresses and the DCCG clock muxes.

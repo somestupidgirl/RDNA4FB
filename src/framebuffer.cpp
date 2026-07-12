@@ -918,6 +918,22 @@ void RDNA4FB::dumpModeState() {
 // DMUB mailbox (display firmware)
 // ---------------------------------------------------------------------------
 
+// Indirect VRAM access through MM_INDEX/MM_DATA (BIF_BX_PF0, BAR5 bytes
+// 0x0 / 0x4 / 0x18) — amdgpu_device_mm_access. Reaches any VRAM byte
+// through the register BAR; the way to touch the DMUB ring in top-of-VRAM
+// firmware memory that the 256 MiB CPU aperture cannot map.
+uint32_t RDNA4FB::vramRead32(uint64_t pos) {
+	rmmio[0x18 / 4] = static_cast<uint32_t>(pos >> 31);
+	rmmio[0]        = (static_cast<uint32_t>(pos) & 0x7ffffffc) | 0x80000000u;
+	return rmmio[1];
+}
+
+void RDNA4FB::vramWrite32(uint64_t pos, uint32_t value) {
+	rmmio[0x18 / 4] = static_cast<uint32_t>(pos >> 31);
+	rmmio[0]        = (static_cast<uint32_t>(pos) & 0x7ffffffc) | 0x80000000u;
+	rmmio[1]        = value;
+}
+
 void RDNA4FB::dmubPing() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubping", &on, sizeof(on)) || on == 0)
@@ -927,65 +943,71 @@ void RDNA4FB::dmubPing() {
 		return;
 	}
 
-	// DMCUB registers (dcn_4_1_0_offset.h, base_idx 2). The inbox1 ring
-	// lives in top-of-VRAM firmware memory outside the 256 MiB CPU aperture
-	// (REGION4 dump below), so use the REGISTER-based inbox0 instead:
-	// dwords 1..15 of the 64-byte command go to MSG0..MSG14, then writing
-	// the header dword (with is_reg_based=1) to RDY triggers the firmware;
-	// the response header lands in RSP (dmub_dcn401.c protocol).
-	constexpr uint32_t kHostIntCsr = 0x0222;
-	constexpr uint32_t kRegInbox0Rdy  = 0x0223;
-	constexpr uint32_t kRegInbox0Msg0 = 0x0224;   // ..MSG14 = 0x0232
-	constexpr uint32_t kRegInbox0Rsp  = 0x0233;
+	// The GOP firmware demonstrably services the inbox1 RING (it consumed
+	// 0x4c0 bytes of GOP commands) but ignored the register inbox0 on
+	// hardware. The ring lives in top-of-VRAM firmware memory (REGION4);
+	// reach it via MM_INDEX/MM_DATA indirect VRAM access.
+	constexpr uint32_t kInbox1Size = 0x01d5;
+	constexpr uint32_t kInbox1Wptr = 0x01d6, kInbox1Rptr = 0x01d7;
 
-	// Context dump: where the firmware's memory windows actually live.
-	// REGION3 CW top registers carry an enable bit (bit 31) + the window id
-	// in the top byte; mask to get the real DMUB-space top.
-	for (uint32_t i = 0; i < 8; i++) {
-		uint32_t cwBase = regReadDmu(2, 0x01a5 + i);
-		uint32_t cwTopRaw = regReadDmu(2, 0x01ad + i);
-		uint64_t cwOff = regReadDmu(2, 0x01b5 + 2 * i) |
-		    (static_cast<uint64_t>(regReadDmu(2, 0x01b6 + 2 * i)) << 32);
-		if (cwTopRaw & 0x80000000u)
-			FBLOG("dmub: cw%u dmub-space 0x%08x..0x%08x -> mc 0x%llx",
-			      i, cwBase, cwTopRaw & 0x0fffffffu, cwOff);
+	uint32_t inboxSize = regReadDmu(2, kInbox1Size);
+	uint32_t wptr = regReadDmu(2, kInbox1Wptr);
+	uint32_t rptr = regReadDmu(2, kInbox1Rptr);
+	if (inboxSize == 0 || inboxSize > 0x100000 || wptr != rptr ||
+	    (wptr % Dmub::kCmdSize) != 0) {
+		FBLOG("dmub: inbox not idle/sane (size=0x%x wptr=0x%x rptr=0x%x)",
+		      inboxSize, wptr, rptr);
+		return;
 	}
-	FBLOG("dmub: region4 (mailbox) mc 0x%llx top=0x%08x",
-	      regReadDmu(2, 0x0196) |
-	      (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32),
-	      regReadDmu(2, 0x01a1));
 
-	uint32_t rsp0 = regReadDmu(2, kRegInbox0Rsp);
-	uint32_t csr0 = regReadDmu(2, kHostIntCsr);
+	// Ring VRAM position: REGION4 (mailbox) MC address minus the VRAM MC
+	// base from DCN_VM_FB_LOCATION_BASE (16 MiB units).
+	uint64_t region4Mc = regReadDmu(2, 0x0196) |
+	    (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32);
+	uint64_t vramMcBase =
+	    static_cast<uint64_t>(regReadDmu(2, 0x0475) & 0xffffff) << 24;
+	if (region4Mc <= vramMcBase) {
+		FBLOG("dmub: region4 mc 0x%llx below vram base 0x%llx", region4Mc, vramMcBase);
+		return;
+	}
+	uint64_t ringPos = (region4Mc - vramMcBase) + wptr;
+	FBLOG("dmub: inbox1 ring at vram+0x%llx (region4 mc 0x%llx), wptr=0x%x",
+	      region4Mc - vramMcBase, region4Mc, wptr);
 
-	// QUERY_FEATURE_CAPS via reg inbox: zero payload registers, then the
-	// header write to RDY submits.
-	for (uint32_t i = 0; i < 15; i++)
-		regWriteDmu(2, kRegInbox0Msg0 + i, 0);
-	uint32_t hdr = Dmub::headerWord(Dmub::CmdQueryFeatureCaps, 0,
-	                                Dmub::kCmdSize - 4, /*regBased=*/true);
-	regWriteDmu(2, kRegInbox0Rdy, hdr);
+	// Sanity: the entry at rptr-64 was written by the GOP; read it back as
+	// proof the MM window reads the same memory the firmware reads.
+	if (wptr >= Dmub::kCmdSize)
+		FBLOG("dmub: previous GOP command header via MM: 0x%08x",
+		      vramRead32(ringPos - Dmub::kCmdSize));
 
-	// Poll for the response header (RSP change or interrupt stat bit 12).
-	uint32_t rsp = rsp0, csr = csr0;
-	bool done = false;
+	// Compose QUERY_FEATURE_CAPS at wptr and submit.
+	vramWrite32(ringPos, Dmub::headerWord(Dmub::CmdQueryFeatureCaps, 0,
+	                                      Dmub::kCmdSize - 4));
+	for (uint32_t i = 1; i < Dmub::kCmdSize / 4; i++)
+		vramWrite32(ringPos + 4 * i, 0);
+	uint32_t rb0 = vramRead32(ringPos);
+	if (rb0 != Dmub::headerWord(Dmub::CmdQueryFeatureCaps, 0, Dmub::kCmdSize - 4)) {
+		FBLOG("dmub: ring write readback mismatch (0x%08x), aborting", rb0);
+		return;
+	}
+
+	uint32_t newWptr = (wptr + Dmub::kCmdSize) % inboxSize;
+	regWriteDmu(2, kInbox1Wptr, newWptr);
+
+	uint32_t nrptr = rptr;
 	for (int i = 0; i < 20000; i++) {
-		rsp = regReadDmu(2, kRegInbox0Rsp);
-		csr = regReadDmu(2, kHostIntCsr);
-		if (rsp != rsp0 || ((csr >> 12) & 1)) { done = true; break; }
+		nrptr = regReadDmu(2, kInbox1Rptr);
+		if (nrptr == newWptr)
+			break;
 		IODelay(10);
 	}
-	if (done) {
-		FBLOG("dmub: PING OK — rsp 0x%08x (was 0x%08x) csr=0x%08x caps: %08x %08x %08x %08x",
-		      rsp, rsp0, csr,
-		      regReadDmu(2, kRegInbox0Msg0), regReadDmu(2, kRegInbox0Msg0 + 1),
-		      regReadDmu(2, kRegInbox0Msg0 + 2), regReadDmu(2, kRegInbox0Msg0 + 3));
-		// Ack the response interrupt (HOST_INTERRUPT_CSR bit 8).
-		regWriteDmu(2, kHostIntCsr, csr | (1u << 8));
-	} else {
-		FBLOG("dmub: ping NOT answered (rdy=0x%08x rsp=0x%08x csr 0x%08x->0x%08x)",
-		      hdr, rsp, csr0, csr);
-	}
+	if (nrptr == newWptr)
+		FBLOG("dmub: PING OK — rptr advanced 0x%x -> 0x%x; reply: %08x %08x %08x",
+		      rptr, nrptr, vramRead32(ringPos), vramRead32(ringPos + 4),
+		      vramRead32(ringPos + 8));
+	else
+		FBLOG("dmub: ping NOT consumed (wptr=0x%x rptr stuck at 0x%x)",
+		      newWptr, nrptr);
 }
 
 void RDNA4FB::setDisplayPower(bool on) {
