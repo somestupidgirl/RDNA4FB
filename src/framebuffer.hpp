@@ -190,14 +190,22 @@ class RDNA4FB : public IOFramebuffer {
 	bool hwCursorRequested { false };
 	bool hwCursorReady     { false };
 	bool hwCursorVisible   { false };
-	// CURSOR_MODE: 2 = premultiplied ARGB (default), 1 = straight alpha.
-	// If the pointer renders with dark/bright fringes, flip with
-	// rdna4-curmode=1.
+	// CURSOR_MODE (dc_cursor_color_format): 2 = premultiplied ARGB
+	// (default), 3 = straight alpha. If the pointer renders with dark or
+	// bright fringes, flip with rdna4-curmode=3. (0/1 are mono formats and
+	// never correct for a converted macOS cursor.)
 	uint32_t hwCursorMode  { 2 };
 	IOMemoryMap       *cursorMap  { nullptr };
 	volatile uint32_t *cursorVram { nullptr };
 	uint32_t *cursorStage { nullptr };  // convertCursorImage staging buffer
 	uint64_t  cursorMcAddr { 0 };       // GPU (MC) address of the sprite
+	// CURSOR_CONTROL image built by setCursorImage (mode/pitch/lines-per-
+	// chunk); setCursorState ORs the enable bit in.
+	uint32_t  cursorCtlBase { 0 };
+	// Bounded diagnostics for cursor bring-up: log the first few calls and
+	// register readbacks so an invisible pointer is debuggable from dmesg.
+	uint8_t   cursorImgLogs { 0 };
+	uint8_t   cursorPosLogs { 0 };
 
 	// Emulated vertical-blank "interrupt" (rdna4-vbl=1). IOFramebuffer
 	// only engages its frame-pacing machinery (CVDisplayLink timestamps,

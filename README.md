@@ -83,7 +83,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-nosleep=1` | Disable display sleep handling (power changes become no-ops again, screen stays on). Escape hatch if blank/unblank misbehaves. |
 | `rdna4-modedump=1` | Read-only survey of the mode-setting registers: all OTG timings/enables, DIG front/back-ends, HUBP surface addresses, DCCG clock muxes, DMUB status. The lit DP pipe is the template for HDMI pipe bring-up. |
 | `rdna4-hwcursor=1` | Enable the DCN hardware cursor plane (sprite in VRAM after the framebuffer, overlaid at scanout). Fixes software-cursor lag under heavy repaint. Opt-in until hardware-verified. |
-| `rdna4-curmode=N` | Cursor pixel mode when hwcursor is on: 2 = premultiplied ARGB (default), 1 = straight alpha. Flip to 1 if the pointer shows dark/bright fringes. |
+| `rdna4-curmode=N` | Cursor pixel mode when hwcursor is on: 2 = premultiplied ARGB (default), 3 = straight alpha. Flip to 3 if the pointer shows dark/bright fringes. |
 | `rdna4-vbl=1` | Provide an emulated vertical-blank interrupt (workloop timer at the EDID refresh rate). Engages IOFramebuffer's frame pacing (CVDisplayLink timestamps, deferred cursor sync) that is otherwise absent without a hardware IRQ handler. |
 
 ## Files

@@ -1055,15 +1055,30 @@ constexpr uint32_t kCurSize     = 0x067c;
 constexpr uint32_t kCurPosition = 0x067d;
 constexpr uint32_t kCurHotSpot  = 0x067e;
 constexpr uint32_t kCmCur0Control = 0x0cf1;
+// HUBPREQ0_CURSOR_SETTINGS — cursor fetch scheduling. amdgpu always programs
+// CHUNK_HDL_ADJUST=3 ([9:8]); without it and a correct LINES_PER_CHUNK the
+// cursor request pipeline can fetch nothing (sprite armed but invisible).
+constexpr uint32_t kCurSettings = 0x0653;
+constexpr uint32_t kCurChunkHdlAdjust = 3u << 8;
 
 // Field layout (dcn_4_1_0_sh_mask.h): CURSOR_CONTROL enable bit0, MODE [9:8],
-// PITCH [17:16]; SIZE height [15:0] width [31:16]; POSITION y [14:0],
-// x starts at bit 15 (NOT 16 on this generation).
+// PITCH [17:16], LINES_PER_CHUNK [25:24]; SIZE height [15:0] width [31:16];
+// POSITION y [14:0], x starts at bit 15 (NOT 16 on this generation).
 constexpr uint32_t kCurModeShift  = 8;
 constexpr uint32_t kCurPitchShift = 16;
+constexpr uint32_t kCurLpcShift   = 24;
 constexpr uint32_t kCurXShift     = 15;
 // CM_CUR0_CURSOR0_CONTROL: CUR0_ENABLE bit0, CUR0_MODE [6:4].
 constexpr uint32_t kCur0ModeShift = 4;
+
+// hubp1_get_lines_per_chunk for color cursors: enum {1,2,4,8,16} lines
+// encodes as 0..4.
+static uint32_t cursorLinesPerChunk(uint32_t width) {
+	if (width <= 32)  return 4;  // 16 lines
+	if (width <= 64)  return 3;  // 8 lines
+	if (width <= 128) return 2;  // 4 lines
+	return 1;                    // 2 lines
+}
 
 // HUBPREQ0 scanout address registers — anchor for the sprite's GPU address.
 constexpr uint32_t kHubpPrimaryAddr     = 0x060a;
@@ -1160,12 +1175,25 @@ IOReturn RDNA4FB::setCursorImage(void *cursorImage) {
 	// setCursorState receives hotspot-adjusted top-left coords, so the
 	// hardware hotspot stays zero.
 	regWriteDmu(2, kCurHotSpot, 0);
-	regWriteDmu(2, kCurControl,
-	            (kCursorPitchCode << kCurPitchShift) |
-	            (hwCursorMode << kCurModeShift) |
-	            (hwCursorVisible ? 1u : 0u));
+	// Fetch scheduling (missing on first hardware try — sprite armed but
+	// invisible): chunk handle deadline adjust + lines per fetch chunk.
+	regWriteDmu(2, kCurSettings, kCurChunkHdlAdjust);
+	cursorCtlBase = (cursorLinesPerChunk(w) << kCurLpcShift) |
+	                (kCursorPitchCode << kCurPitchShift) |
+	                (hwCursorMode << kCurModeShift);
+	regWriteDmu(2, kCurControl, cursorCtlBase | (hwCursorVisible ? 1u : 0u));
 	regWriteDmu(2, kCmCur0Control,
 	            (hwCursorMode << kCur0ModeShift) | (hwCursorVisible ? 1u : 0u));
+
+	if (cursorImgLogs < 3) {
+		cursorImgLogs++;
+		FBLOG("cursor: image %ux%u px0=0x%08x rb: ctl=0x%08x size=0x%08x "
+		      "addr=0x%08x/%04x set=0x%08x cm=0x%08x",
+		      w, h, cursorStage[0],
+		      regReadDmu(2, kCurControl), regReadDmu(2, kCurSize),
+		      regReadDmu(2, kCurAddr), regReadDmu(2, kCurAddrHigh) & 0xffff,
+		      regReadDmu(2, kCurSettings), regReadDmu(2, kCmCur0Control));
+	}
 	return kIOReturnSuccess;
 }
 
@@ -1180,13 +1208,18 @@ IOReturn RDNA4FB::setCursorState(SInt32 x, SInt32 y, bool visible) {
 	regWriteDmu(2, kCurPosition,
 	            (static_cast<uint32_t>(y) & 0x7fff) |
 	            (static_cast<uint32_t>(x) << kCurXShift));
-	regWriteDmu(2, kCurControl,
-	            (kCursorPitchCode << kCurPitchShift) |
-	            (hwCursorMode << kCurModeShift) |
-	            (visible ? 1u : 0u));
+	if (cursorCtlBase)   // 0 until the first setCursorImage
+		regWriteDmu(2, kCurControl, cursorCtlBase | (visible ? 1u : 0u));
 	regWriteDmu(2, kCmCur0Control,
 	            (hwCursorMode << kCur0ModeShift) | (visible ? 1u : 0u));
 	hwCursorVisible = visible;
+
+	if (cursorPosLogs < 3) {
+		cursorPosLogs++;
+		FBLOG("cursor: state x=%d y=%d vis=%d rb: pos=0x%08x ctl=0x%08x",
+		      (int)x, (int)y, visible,
+		      regReadDmu(2, kCurPosition), regReadDmu(2, kCurControl));
+	}
 	return kIOReturnSuccess;
 }
 
@@ -1357,7 +1390,8 @@ bool RDNA4FB::start(IOService *provider) {
 	if (PE_parse_boot_argn("rdna4-hwcursor", &hwcur, sizeof(hwcur)) && hwcur != 0) {
 		hwCursorRequested = true;
 		uint32_t cmode = 0;
-		if (PE_parse_boot_argn("rdna4-curmode", &cmode, sizeof(cmode)) && cmode <= 3)
+		if (PE_parse_boot_argn("rdna4-curmode", &cmode, sizeof(cmode)) &&
+		    (cmode == 2 || cmode == 3))   // 2 premult, 3 straight alpha
 			hwCursorMode = cmode;
 	}
 
