@@ -206,6 +206,7 @@ class RDNA4FB : public IOFramebuffer {
 	// register readbacks so an invisible pointer is debuggable from dmesg.
 	uint8_t   cursorImgLogs { 0 };
 	uint8_t   cursorPosLogs { 0 };
+	uint32_t  cursorPosCalls { 0 };
 
 	// Emulated vertical-blank "interrupt" (rdna4-vbl=1). IOFramebuffer
 	// only engages its frame-pacing machinery (CVDisplayLink timestamps,

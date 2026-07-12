@@ -1076,6 +1076,18 @@ constexpr uint32_t kCurFpScaleOne       = 0x3c00;  // FP16 1.0
 constexpr uint32_t kOtgMasterUpdateLock  = 0x1b89;
 constexpr uint32_t kOtgDoubleBufferCtl   = 0x1b5c;
 constexpr uint32_t kDppTopControl        = 0x0cc5;
+// Global sync: pipe updates latch on the VUPDATE pulse, which is a
+// PROGRAMMABLE event (offset/width lines, positioned via VSTARTUP). amdgpu
+// programs it at every modeset; a GOP that never updates its pipe again has
+// no reason to program a pulse at all — width 0 means the latch event never
+// fires and every double-buffered write stays pending forever. This also
+// retroactively explains the earlier 8bpc/MCM writes that read back changed
+// but never altered the picture. GLOBAL_SYNC_STATUS bit 8
+// (VUPDATE_EVENT_OCCURRED) is the ground truth.
+constexpr uint32_t kOtgVStartupParam     = 0x1b85;
+constexpr uint32_t kOtgVUpdateParam      = 0x1b86;
+constexpr uint32_t kOtgVReadyParam       = 0x1b87;
+constexpr uint32_t kOtgGlobalSyncStatus  = 0x1b88;
 // HUBPREQ0_CURSOR_SETTINGS — cursor fetch scheduling. amdgpu always programs
 // CHUNK_HDL_ADJUST=3 ([9:8]); without it and a correct LINES_PER_CHUNK the
 // cursor request pipeline can fetch nothing (sprite armed but invisible).
@@ -1170,6 +1182,26 @@ bool RDNA4FB::initHWCursor() {
 		regWriteDmu(2, kOtgMasterUpdateLock, 0);
 		FBLOG("cursor: released OTG master update lock (was 0x%08x, now 0x%08x)",
 		      lock, regReadDmu(2, kOtgMasterUpdateLock));
+	}
+
+	// Ensure the VUPDATE latch pulse exists. Without it, no pipe update we
+	// ever queue becomes live.
+	uint32_t vstartup = regReadDmu(2, kOtgVStartupParam);
+	uint32_t vupdate  = regReadDmu(2, kOtgVUpdateParam);
+	uint32_t sync     = regReadDmu(2, kOtgGlobalSyncStatus);
+	FBLOG("cursor: global sync: vstartup=0x%08x vupdate=0x%08x vready=0x%08x "
+	      "status=0x%08x (vupdate_occurred=%u)",
+	      vstartup, vupdate, regReadDmu(2, kOtgVReadyParam), sync,
+	      (sync >> 8) & 1);
+	if (((vupdate >> 16) & 0x3ff) == 0) {
+		// Pulse of 2 lines right at VSTARTUP. If VSTARTUP is also
+		// unprogrammed, place it inside the vertical blank (the Samsung
+		// timing has 62 blank lines; 40 is safely within any mode's blank).
+		if ((vstartup & 0x3ff) == 0)
+			regWriteDmu(2, kOtgVStartupParam, 40);
+		regWriteDmu(2, kOtgVUpdateParam, (2u << 16));
+		FBLOG("cursor: programmed VUPDATE pulse (vstartup=0x%08x vupdate=0x%08x)",
+		      regReadDmu(2, kOtgVStartupParam), regReadDmu(2, kOtgVUpdateParam));
 	}
 
 	FBLOG("cursor: HW cursor armed: scanout MC 0x%llx, sprite MC 0x%llx "
@@ -1283,23 +1315,31 @@ IOReturn RDNA4FB::setCursorState(SInt32 x, SInt32 y, bool visible) {
 	// MHz boot pixel clock; precision is uncritical (it is a deadline hint).
 	regWriteDmu(2, kCurDstOffset,
 	            (static_cast<uint32_t>(x) * 100000u) / 533250u);
-	if (cursorCtlBase)   // 0 until the first setCursorImage
-		regWriteDmu(2, kCurControl, cursorCtlBase | (visible ? 1u : 0u));
-	regWriteDmu(2, kCmCur0Control,
-	            (hwCursorMode << kCur0ModeShift) | (visible ? 1u : 0u));
+	// Only touch the double-buffered control registers on visibility
+	// changes — rewriting them every move re-arms UPDATE_PENDING and hides
+	// whether latching ever completes.
+	if (visible != hwCursorVisible) {
+		if (cursorCtlBase)   // 0 until the first setCursorImage
+			regWriteDmu(2, kCurControl, cursorCtlBase | (visible ? 1u : 0u));
+		regWriteDmu(2, kCmCur0Control,
+		            (hwCursorMode << kCur0ModeShift) | (visible ? 1u : 0u));
+	}
 	hwCursorVisible = visible;
 
-	if (cursorPosLogs < 6) {
+	// Log the first few calls, then a sparse sample of later ones — the
+	// later samples show whether CUR0_UPDATE_PENDING (cm bit 16) ever
+	// clears and whether VUPDATE events occur (sync bit 8) once the
+	// control registers are left alone between visibility changes.
+	cursorPosCalls++;
+	if (cursorPosLogs < 6 ||
+	    (cursorPosLogs < 14 && (cursorPosCalls & 0x1ff) == 0)) {
 		cursorPosLogs++;
-		// cm bit16 is CUR0_UPDATE_PENDING (true status): stuck at 1 means
-		// pipe updates are not latching; it must read 0 within a frame.
-		FBLOG("cursor: state x=%d y=%d vis=%d rb: pos=0x%08x ctl=0x%08x "
-		      "cm=0x%08x lock=0x%08x pend=%u",
-		      (int)x, (int)y, visible,
+		FBLOG("cursor: state#%u x=%d y=%d vis=%d rb: pos=0x%08x ctl=0x%08x "
+		      "cm=0x%08x sync=0x%08x",
+		      cursorPosCalls, (int)x, (int)y, visible,
 		      regReadDmu(2, kCurPosition), regReadDmu(2, kCurControl),
 		      regReadDmu(2, kCmCur0Control),
-		      regReadDmu(2, kOtgMasterUpdateLock),
-		      regReadDmu(2, kOtgDoubleBufferCtl) & 1);
+		      regReadDmu(2, kOtgGlobalSyncStatus));
 	}
 	return kIOReturnSuccess;
 }
