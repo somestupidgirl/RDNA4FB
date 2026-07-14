@@ -1001,6 +1001,46 @@ void RDNA4FB::vramWrite32(uint64_t pos, uint32_t value) {
 // GOP leave an interrupt ring configured? — usually not), the per-OTG
 // vertical-interrupt line config on the DCN side, and the PCI MSI/MSI-X
 // capability state. Writes nothing.
+// rdna4-pspdump=1: read-only survey of the PSP (security processor) —
+// the gatekeeper for loading fresh firmware (a current dmub_dcn401.bin
+// would replace the limited GOP DMUB). Registers are the MPASP scratch
+// block (mp_14_0_2_offset.h, MP0 base_idx 0), semantics per upstream
+// psp_v14_0.c and lemonade-sdk/mac-amdgpu (MIT), which drove the full
+// LOAD_IP_FW chain on this die from macOS. Nothing is written: this only
+// answers "is the GOP-posted PSP alive and command-able?".
+void RDNA4FB::dumpPSP() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-pspdump", &on, sizeof(on)) || on == 0)
+		return;
+	if (!ipDiscovery.isValid() || !rmmio)
+		return;
+
+	auto psp = [&](uint32_t dword) -> uint32_t {
+		uint32_t off;
+		if (!ipDiscovery.regByteOffset(IpDiscovery::HwMp0, 0, 0, dword, off) ||
+		    off + 4 > rmmioSize)
+			return 0xFFFFFFFF;
+		return rmmio[off / 4];
+	};
+
+	uint32_t boot = psp(0x0063);   // C2PMSG_35: bit31 = bootloader ready
+	uint32_t sol  = psp(0x0091);   // C2PMSG_81: nonzero = sOS alive (build stamp)
+	uint32_t ring = psp(0x0080);   // C2PMSG_64: GPCOM ring status
+	FBLOG("psp: boot(C2PMSG_35)=0x%08x sos(C2PMSG_81)=0x%08x ring(C2PMSG_64)=0x%08x",
+	      boot, sol, ring);
+	FBLOG("psp: ring regs 69/70/71 = 0x%08x 0x%08x 0x%08x, fw ver 58/59 = "
+	      "0x%08x 0x%08x",
+	      psp(0x0085), psp(0x0086), psp(0x0087), psp(0x007a), psp(0x007b));
+	FBLOG("psp: verdict: bootloader %s, sOS %s, GPCOM ring %s",
+	      (boot & 0x80000000u) ? "READY" : "not ready",
+	      sol ? "ALIVE" : "not running",
+	      (ring & 0x80000000u) ? "configured" : "not configured");
+	if (sol) {
+		setProperty("PSP,SOSVersion", static_cast<uint64_t>(sol), 32);
+		setProperty("PSP,Alive", true);
+	}
+}
+
 void RDNA4FB::dumpIH() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-ihdump", &on, sizeof(on)) || on == 0)
@@ -1965,6 +2005,7 @@ bool RDNA4FB::start(IOService *provider) {
 		dmubCursorTest();
 		smuPing();
 		dumpIH();
+		dumpPSP();
 	}
 
 	if (!super::start(provider)) {

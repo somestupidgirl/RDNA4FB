@@ -161,6 +161,11 @@ class RDNA4FB : public IOFramebuffer {
 	// capabilities. Groundwork for replacing the timer VBL with real
 	// vertical-blank interrupts.
 	void dumpIH();
+	// Boot-arg "rdna4-pspdump=1": read-only PSP (security processor) state —
+	// bootloader/sOS/ring status from the MPASP scratch registers. Decides
+	// whether a future LOAD_IP_FW (e.g. a current DMUB) is viable against
+	// the GOP-posted PSP.
+	void dumpPSP();
 	// Boot-arg "rdna4-dmubcursor=1" (requires rdna4-hwcursor=1): send our
 	// cursor register images to the firmware via DMUB_CMD__UPDATE_CURSOR_INFO
 	// and let IT program the cursor plane — the flanking move after direct
