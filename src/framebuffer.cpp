@@ -988,6 +988,78 @@ void RDNA4FB::vramWrite32(uint64_t pos, uint32_t value) {
 	rmmio[1]        = value;
 }
 
+// rdna4-smuping=1: first contact with the SMU power-management firmware
+// (MP1 mailbox, smu_v14_0_send_msg_with_param protocol; offsets from
+// mp_14_0_2_offset.h, port informed by lemonade-sdk/mac-amdgpu, MIT).
+// Read-only: TestMessage plus two version queries — no DPM state is
+// touched, so the live display is unaffected. A responding SMU is the
+// prerequisite for the clocks/power roadmap item.
+void RDNA4FB::smuPing() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-smuping", &on, sizeof(on)) || on == 0)
+		return;
+	if (!ipDiscovery.isValid() || !rmmio) {
+		FBLOG("smu: MMIO/discovery unavailable, skipping ping");
+		return;
+	}
+
+	// regMP1_SMN_C2PMSG_66/82/90, all BASE_IDX 1 (base 0 routes the writes
+	// to a different physical register and the SMU never answers).
+	uint32_t regMsg, regParam, regResp;
+	if (!ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 1, 0x0082, regMsg) ||
+	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 1, 0x0092, regParam) ||
+	    !ipDiscovery.regByteOffset(IpDiscovery::HwMp1, 0, 1, 0x009a, regResp)) {
+		FBLOG("smu: MP1 base_idx 1 not in discovery table");
+		return;
+	}
+	FBLOG("smu: mailbox msg@0x%x param@0x%x resp@0x%x", regMsg, regParam, regResp);
+	if (regMsg + 4 > rmmioSize || regParam + 4 > rmmioSize || regResp + 4 > rmmioSize) {
+		FBLOG("smu: mailbox outside BAR5 aperture");
+		return;
+	}
+
+	// One message exchange: clear resp, stage param, kick, poll resp.
+	// Response codes: 1 OK, 0xFF failed, 0xFE unknown cmd, 0xFD prereq,
+	// 0xFC busy.
+	auto send = [&](uint32_t msgId, uint32_t param, uint32_t *ret) -> uint32_t {
+		rmmio[regResp / 4]  = 0;
+		rmmio[regParam / 4] = param;
+		rmmio[regMsg / 4]   = msgId;
+		uint32_t resp = 0;
+		for (int i = 0; i < 500; i++) {         // 500 ms budget
+			resp = rmmio[regResp / 4];
+			if (resp != 0)
+				break;
+			IOSleep(1);
+		}
+		if (ret)
+			*ret = rmmio[regParam / 4];
+		return resp;
+	};
+
+	// PPSMC message ids (smu_v14_0_2_ppsmc.h): TestMessage=1,
+	// GetSmuVersion=2, GetDriverIfVersion=3.
+	uint32_t ret = 0;
+	uint32_t resp = send(0x1, 0xC0FFEE, &ret);
+	if (resp != 1) {
+		FBLOG("smu: TestMessage resp=0x%02x — PMFW not answering (ret=0x%08x)",
+		      resp, ret);
+		return;
+	}
+	FBLOG("smu: PING OK — TestMessage acked (ret=0x%08x)", ret);
+
+	if (send(0x2, 0, &ret) == 1) {
+		FBLOG("smu: PMFW version 0x%08x (%u.%u.%u)", ret,
+		      (ret >> 16) & 0xff, (ret >> 8) & 0xff, ret & 0xff);
+		setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ret), 32);
+	}
+	if (send(0x3, 0, &ret) == 1) {
+		FBLOG("smu: driver interface version 0x%08x", ret);
+		setProperty("SMU,DriverIfVersion", static_cast<uint64_t>(ret), 32);
+	}
+	setProperty("SMU,Verified", true);
+}
+
 void RDNA4FB::dmubPing() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubping", &on, sizeof(on)) || on == 0)
@@ -1838,6 +1910,7 @@ bool RDNA4FB::start(IOService *provider) {
 		initHWCursor();
 		dmubPing();
 		dmubCursorTest();
+		smuPing();
 	}
 
 	if (!super::start(provider)) {
