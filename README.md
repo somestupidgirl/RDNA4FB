@@ -145,10 +145,12 @@ file build/RDNA4FB.kext/Contents/MacOS/RDNA4FB   # Mach-O 64-bit kext bundle x86
    qualify). If `kmutil` complains about approval, allow the extension in
    System Preferences → Security & Privacy and re-run.
 
-2. Inject the **full 2 MiB flash dump** (the `.rom` in `firmware/`) as
-   `ATY,bin_image` under the GPU's PciRoot path in OpenCore
-   `DeviceProperties` — the IP discovery binary lives in the PSP region of
-   the flash, which the PCI expansion ROM does not expose.
+2. *(Optional since the on-die discovery fallback)* Inject the **full
+   2 MiB flash dump** (the `.rom` in `firmware/`) as `ATY,bin_image` under
+   the GPU's PciRoot path in OpenCore `DeviceProperties`. Without it the
+   driver reads the PSP's IP-discovery copy from the top-of-VRAM TMR via
+   MM_INDEX/MM_DATA (`Discovery,Source` in ioreg shows which path won) and
+   the VBIOS data tables from the PCI expansion ROM.
 
 3. Recommended while bringing this up: `-v keepsyms=1` boot-args, and disable
    other GPU-related kexts (WhateverGreen) so nothing fights over the device.

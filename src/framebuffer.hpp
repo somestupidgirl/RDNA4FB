@@ -81,6 +81,12 @@ class RDNA4FB : public IOFramebuffer {
 
 	bool captureConsoleInfo();
 	bool loadVBIOS();
+	// Fallback when no full flash dump is injected: read the PSP's on-die
+	// IP discovery copy from the top-of-VRAM TMR via MM_INDEX/MM_DATA
+	// (technique from lemonade-sdk/mac-amdgpu, MIT). Makes ATY,bin_image
+	// optional.
+	bool loadOnDieDiscovery();
+	uint8_t *onDieDisc { nullptr };
 	bool copyVBIOSFromProperty();
 	bool copyVBIOSFromExpansionROM();
 	void publishVBIOSInfo();

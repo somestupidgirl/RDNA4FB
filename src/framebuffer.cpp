@@ -207,6 +207,7 @@ bool RDNA4FB::loadVBIOS() {
 	if (ipDiscovery.init(vbiosData, vbiosSize)) {
 		FBLOG("discovery: binary at +0x%zx, %u IPs", ipDiscovery.binaryOffset(),
 		      ipDiscovery.ipCount());
+		setProperty("Discovery,Source", "VBIOS image");
 		IpDiscovery::IpEntry gc, dmu;
 		if (ipDiscovery.findIp(IpDiscovery::HwGc, 0, gc)) {
 			char ver[16];
@@ -241,6 +242,59 @@ bool RDNA4FB::loadVBIOS() {
 		else
 			FBLOG("cmd: %s absent", c.name);
 	}
+	return true;
+}
+
+bool RDNA4FB::loadOnDieDiscovery() {
+	// The PSP keeps a copy of the IP discovery binary in a reserved region
+	// at the top of VRAM (upstream: DISCOVERY_TMR_OFFSET = 64 KiB below the
+	// end, DISCOVERY_TMR_SIZE = 10 KiB) — present on every powered-on card,
+	// no ROM dump needed. It sits far outside the CPU aperture, so read it
+	// through MM_INDEX/MM_DATA. Technique per lemonade-sdk/mac-amdgpu
+	// (MIT) amdgpu_discovery.cpp and upstream amdgpu_discovery.c.
+	constexpr uint32_t kTmrSize   = 10 << 10;
+	constexpr uint32_t kTmrOffset = 64 << 10;
+	constexpr uint32_t kMemsizeFallback = 0x378c; // NBIF RCC_CONFIG_MEMSIZE
+
+	if (!rmmio)
+		return false;
+	uint32_t vramMB = regRead32(kMemsizeFallback);
+	if (vramMB == 0 || vramMB == 0xFFFFFFFF) {
+		FBLOG("discovery: on-die: VRAM size unreadable (0x%08x)", vramMB);
+		return false;
+	}
+
+	onDieDisc = static_cast<uint8_t *>(IOMalloc(kTmrSize));
+	if (!onDieDisc)
+		return false;
+
+	uint64_t pos = (static_cast<uint64_t>(vramMB) << 20) - kTmrOffset;
+	uint32_t *dw = reinterpret_cast<uint32_t *>(onDieDisc);
+	for (uint32_t i = 0; i < kTmrSize / 4; i++)
+		dw[i] = vramRead32(pos + 4ULL * i);
+
+	FBLOG("discovery: on-die TMR at vram+0x%llx, first dwords %08x %08x",
+	      pos, dw[0], dw[1]);
+	if (!ipDiscovery.init(onDieDisc, kTmrSize)) {
+		FBLOG("discovery: on-die TMR did not validate");
+		IOFree(onDieDisc, kTmrSize);
+		onDieDisc = nullptr;
+		return false;
+	}
+
+	FBLOG("discovery: on-die binary valid, %u IPs (no ROM injection needed)",
+	      ipDiscovery.ipCount());
+	IpDiscovery::IpEntry gc, dmu;
+	char ver[16];
+	if (ipDiscovery.findIp(IpDiscovery::HwGc, 0, gc)) {
+		snprintf(ver, sizeof(ver), "%u.%u.%u", gc.major, gc.minor, gc.revision);
+		setProperty("Discovery,GCVersion", ver);
+	}
+	if (ipDiscovery.findIp(IpDiscovery::HwDmu, 0, dmu)) {
+		snprintf(ver, sizeof(ver), "%u.%u.%u", dmu.major, dmu.minor, dmu.revision);
+		setProperty("Discovery,DCNVersion", ver);
+	}
+	setProperty("Discovery,Source", "on-die TMR");
 	return true;
 }
 
@@ -1747,13 +1801,22 @@ bool RDNA4FB::start(IOService *provider) {
 	// mastering — we never issue DMA.
 	pciDevice->setMemoryEnable(true);
 
+	// Registers first: the on-die discovery fallback needs MMIO.
+	bool haveMmio = mapRegisters();
+
 	// Best effort: connector layout and firmware info for later native
 	// mode-setting work. The framebuffer itself does not depend on this.
 	loadVBIOS();
 
+	// If the VBIOS route did not yield IP discovery (no full flash dump
+	// injected), read the PSP's on-die copy from top-of-VRAM — makes the
+	// ATY,bin_image injection optional.
+	if (haveMmio && !ipDiscovery.isValid())
+		loadOnDieDiscovery();
+
 	// Best effort: prove register MMIO works with one safe read (VRAM size),
 	// then dump the DCN output-colour registers (read-only) for diagnosis.
-	if (mapRegisters()) {
+	if (haveMmio) {
 		probeMemSize();
 		dumpDCN();
 		tryForce8bpc();
@@ -1793,6 +1856,10 @@ void RDNA4FB::stop(IOService *provider) {
 		cursorMap->release();
 		cursorMap = nullptr;
 		cursorVram = nullptr;
+	}
+	if (onDieDisc) {
+		IOFree(onDieDisc, 10 << 10);
+		onDieDisc = nullptr;
 	}
 	unmapRegisters();
 	freeVBIOS();
