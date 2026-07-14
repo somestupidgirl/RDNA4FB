@@ -156,6 +156,11 @@ class RDNA4FB : public IOFramebuffer {
 	// registers. No DPM changes; prerequisite check for the clocks/power
 	// roadmap item. Port informed by lemonade-sdk/mac-amdgpu (MIT).
 	void smuPing();
+	// Boot-arg "rdna4-ihdump=1": read-only survey of interrupt delivery —
+	// OSSSYS IH ring state, per-OTG vertical-interrupt lines, PCI MSI/MSI-X
+	// capabilities. Groundwork for replacing the timer VBL with real
+	// vertical-blank interrupts.
+	void dumpIH();
 	// Boot-arg "rdna4-dmubcursor=1" (requires rdna4-hwcursor=1): send our
 	// cursor register images to the firmware via DMUB_CMD__UPDATE_CURSOR_INFO
 	// and let IT program the cursor plane — the flanking move after direct

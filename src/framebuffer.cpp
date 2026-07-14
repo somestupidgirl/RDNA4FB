@@ -994,6 +994,59 @@ void RDNA4FB::vramWrite32(uint64_t pos, uint32_t value) {
 // Read-only: TestMessage plus two version queries — no DPM state is
 // touched, so the live display is unaffected. A responding SMU is the
 // prerequisite for the clocks/power roadmap item.
+// rdna4-ihdump=1: read-only survey of the interrupt delivery landscape —
+// the prerequisite map for replacing the timer-emulated VBL with real
+// vertical-blank interrupts (IH v7 ring + MSI, as brought up on this die
+// by lemonade-sdk/mac-amdgpu). Dumps the OSSSYS IH ring state (did the
+// GOP leave an interrupt ring configured? — usually not), the per-OTG
+// vertical-interrupt line config on the DCN side, and the PCI MSI/MSI-X
+// capability state. Writes nothing.
+void RDNA4FB::dumpIH() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-ihdump", &on, sizeof(on)) || on == 0)
+		return;
+	if (!ipDiscovery.isValid() || !rmmio)
+		return;
+
+	// OSSSYS IH ring registers (osssys_7_0_0_offset.h, base_idx 0).
+	auto ihRead = [&](uint32_t dword) -> uint32_t {
+		uint32_t off;
+		if (!ipDiscovery.regByteOffset(IpDiscovery::HwOsssys, 0, 0, dword, off) ||
+		    off + 4 > rmmioSize)
+			return 0xFFFFFFFF;
+		return rmmio[off / 4];
+	};
+	FBLOG("ih: RB cntl=0x%08x base=0x%08x/%08x rptr=0x%08x wptr=0x%08x "
+	      "doorbell=0x%08x cntl2=0x%08x status=0x%08x",
+	      ihRead(0x0080), ihRead(0x0083), ihRead(0x0084),
+	      ihRead(0x0081), ihRead(0x0082), ihRead(0x0087),
+	      ihRead(0x00a8), ihRead(0x00c2));
+
+	// DCN-side vertical interrupt lines for the live OTG: three independent
+	// lines, each with a raster position trigger and an enable. amdgpu uses
+	// line 0 for VUPDATE-ish events, line 2 for the VBLANK the DRM core
+	// consumes. All-zero controls mean the GOP never enabled any of them.
+	FBLOG("ih: OTG0 vline0 pos=0x%08x ctl=0x%08x  vline1 pos=0x%08x ctl=0x%08x  "
+	      "vline2 pos=0x%08x ctl=0x%08x",
+	      regReadDmu(2, 0x1b5f), regReadDmu(2, 0x1b60),
+	      regReadDmu(2, 0x1b61), regReadDmu(2, 0x1b62),
+	      regReadDmu(2, 0x1b63), regReadDmu(2, 0x1b64));
+
+	// PCI interrupt capability state: MSI (cap 0x05) and MSI-X (cap 0x11).
+	// A kext receives these via IOInterruptEventSource once enabled; this
+	// records what the config space offers before we ever touch it.
+	if (pciDevice) {
+		IOByteCount capMsi = 0, capMsix = 0;
+		uint32_t msiCtl = 0, msixCtl = 0;
+		if (pciDevice->extendedFindPCICapability(0x05, &capMsi) && capMsi)
+			msiCtl = pciDevice->configRead32(static_cast<uint8_t>(capMsi));
+		if (pciDevice->extendedFindPCICapability(0x11, &capMsix) && capMsix)
+			msixCtl = pciDevice->configRead32(static_cast<uint8_t>(capMsix));
+		FBLOG("ih: pci msi cap@0x%x ctl=0x%08x, msi-x cap@0x%x ctl=0x%08x",
+		      (uint32_t)capMsi, msiCtl, (uint32_t)capMsix, msixCtl);
+	}
+}
+
 void RDNA4FB::smuPing() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-smuping", &on, sizeof(on)) || on == 0)
@@ -1911,6 +1964,7 @@ bool RDNA4FB::start(IOService *provider) {
 		dmubPing();
 		dmubCursorTest();
 		smuPing();
+		dumpIH();
 	}
 
 	if (!super::start(provider)) {

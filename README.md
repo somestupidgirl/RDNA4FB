@@ -90,6 +90,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-dmubping=1` | First contact with the DMUB display firmware: resolve the inbox1 ring through the DMCUB region windows, submit one QUERY_FEATURE_CAPS command, verify RPTR advances. Proves the mailbox route for mode setting. |
 | `rdna4-dmubcursor=1` | (with `rdna4-hwcursor=1`) Ask the DMUB firmware to program the cursor plane from our register images (DMUB_CMD__UPDATE_CURSOR_INFO, two chained ring entries). White 64x64 square at (100,100) = firmware can light the cursor. |
 | `rdna4-smuping=1` | Read-only SMU (power-management firmware) handshake: TestMessage + PMFW/interface version queries over the MP1 mailbox. No DPM changes. Publishes `SMU,FirmwareVersion` / `SMU,Verified`. Prerequisite check for future clock control. |
+| `rdna4-ihdump=1` | Read-only interrupt-delivery survey: OSSSYS IH ring state, per-OTG vertical-interrupt line config, PCI MSI/MSI-X capability words. Groundwork for real VBL interrupts replacing the timer emulation. |
 | `rdna4-vbl=1` | Provide an emulated vertical-blank interrupt (workloop timer at the EDID refresh rate). Engages IOFramebuffer's frame pacing (CVDisplayLink timestamps, deferred cursor sync) that is otherwise absent without a hardware IRQ handler. |
 
 ## Files
