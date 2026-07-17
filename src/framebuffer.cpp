@@ -1199,6 +1199,44 @@ void RDNA4FB::dmubHistory() {
 	FBLOG("dmub-hist: --- end (this is the DP0 bring-up recipe to adapt for HDMI) ---");
 }
 
+// rdna4-dmubver=1: read-only fingerprint of the GOP-loaded DMUB firmware so
+// its command dialect can be matched against the amdgpu-loaded DMUB on the
+// Debian dual-boot. amdgpu's captured HDMI modeset uses mainline VBIOS
+// subtypes (0 encoder / 1 transmitter / 2 pixel-clock), but that is a
+// different firmware blob than the GOP's — whose own DP0 bring-up spoke
+// subtypes 6/10/12/16. If the two firmware versions match, the mainline
+// recipe is safe to replay against this DMUB; if not, the GOP has its own
+// dialect and the capture is reference-only. DMUB surfaces build/version/
+// boot state in the DMCUB_SCRATCH bank (SCRATCH0 = boot status; higher
+// slots carry version/build markers on most builds). Pure register reads —
+// no ring traffic, no state change, safe alongside the live DP0 console.
+void RDNA4FB::dumpDmubVersion() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-dmubver", &on, sizeof(on)) || on == 0)
+		return;
+	if (!rmmio)
+		return;
+
+	// DMCUB_SCRATCH0 is DMU dword 0x01e3; the bank runs consecutively up to
+	// DMCUB_CNTL at 0x01f6 (SCRATCH0..SCRATCH18).
+	constexpr uint32_t kScratch0 = 0x01e3;
+	for (uint32_t i = 0; i < 18; i += 6) {
+		FBLOG("dmubver: SCRATCH%02u-%02u = 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x",
+		      i, i + 5,
+		      regReadDmu(2, kScratch0 + i + 0), regReadDmu(2, kScratch0 + i + 1),
+		      regReadDmu(2, kScratch0 + i + 2), regReadDmu(2, kScratch0 + i + 3),
+		      regReadDmu(2, kScratch0 + i + 4), regReadDmu(2, kScratch0 + i + 5));
+	}
+	// Enable/boot context plus region4 mc (the ring lives here) — the anchor
+	// for the fw-meta read we escalate to if the scratch bank is inconclusive.
+	uint64_t region4Mc = regReadDmu(2, 0x0196) |
+	    (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32);
+	FBLOG("dmubver: cntl=0x%08x cntl2=0x%08x region4 mc=0x%llx",
+	      regReadDmu(2, 0x01f6), regReadDmu(2, 0x0200), region4Mc);
+	FBLOG("dmubver: compare against Debian `dmesg | grep -i dmub` (version=0x...) "
+	      "— a matching value in the scratch bank means mainline dialect");
+}
+
 void RDNA4FB::dmubPing() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubping", &on, sizeof(on)) || on == 0)
@@ -2048,6 +2086,7 @@ bool RDNA4FB::start(IOService *provider) {
 		dumpModeState();
 		initHWCursor();
 		dmubHistory();
+		dumpDmubVersion();
 		dmubPing();
 		dmubCursorTest();
 		smuPing();

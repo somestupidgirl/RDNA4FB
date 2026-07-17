@@ -156,6 +156,14 @@ class RDNA4FB : public IOFramebuffer {
 	// accepted on this silicon, to adapt for the HDMI pipe. Runs before
 	// dmubPing so it captures the pristine GOP history.
 	void dmubHistory();
+	// Boot-arg "rdna4-dmubver=1": read-only fingerprint of the GOP-loaded
+	// DMUB firmware (DMCUB_SCRATCH bank + boot/enable state) so its command
+	// dialect can be matched against the amdgpu-loaded DMUB on the Debian
+	// dual-boot. amdgpu's HDMI capture uses mainline VBIOS subtypes, but the
+	// GOP's own DP bring-up used subtypes 6/10/12/16 — a different blob may
+	// mean a different dialect. A matching version says the mainline recipe
+	// is safe to replay; a mismatch says the GOP speaks its own. No writes.
+	void dumpDmubVersion();
 	// Boot-arg "rdna4-smuping=1": read-only SMU (PMFW) mailbox handshake —
 	// TestMessage + firmware/interface version queries via the MP1 C2PMSG
 	// registers. No DPM changes; prerequisite check for the clocks/power

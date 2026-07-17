@@ -11,7 +11,7 @@
 #
 # Boot-args for the full survey round:
 #   rdna4-smuping=1 rdna4-ihdump=1 rdna4-pspdump=1 rdna4-dmubping=1 \
-#   rdna4-dmubhist=1 rdna4-modedump=1 rdna4-vbl=1
+#   rdna4-dmubhist=1 rdna4-dmubver=1 rdna4-modedump=1 rdna4-vbl=1
 # (add rdna4-hwcursor=1 / rdna4-dmubcursor=1 for cursor experiments;
 #  optionally remove the ATY,bin_image DeviceProperties entry to exercise
 #  the on-die IP discovery path — check "Discovery,Source" below)
@@ -53,8 +53,8 @@ gated() {
 	section "active RDNA4FB boot-args"
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
-	         curmode curtest dmubping dmubhist dmubcursor smuping ihdump \
-	         pspdump vbl; do
+	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
+	         ihdump pspdump vbl; do
 		have_arg "$a" && found="$found rdna4-$a=1"
 	done
 	[ -n "$found" ] && echo "active:$found" || echo "(no rdna4-* boot-args set)"
@@ -83,6 +83,9 @@ gated() {
 	# DMUB: catches both 'dmub:' (ping) and 'dmub-hist:' (GOP command decode).
 	gated "DMUB mailbox + GOP command history" 'RDNA4FB: dmub' dmubping
 
+	gated "DMUB firmware fingerprint (dialect check vs amdgpu)" \
+		'RDNA4FB: dmubver:' dmubver
+
 	gated "SMU handshake" 'RDNA4FB: smu:' smuping
 	gated "interrupt-delivery survey" 'RDNA4FB: ih:' ihdump
 	gated "PSP status" 'RDNA4FB: psp:' pspdump
@@ -110,4 +113,6 @@ echo "  smu:  'PING OK — TestMessage acked' + PMFW version"
 echo "  psp:  'verdict: bootloader READY, sOS ALIVE, ...'"
 echo "  ih:   RB cntl/base all-zero = GOP left no interrupt ring (expected)"
 echo "  dmub: 'PING OK — rptr advanced' + dmub-hist command decode"
+echo "  dmubver: SCRATCH bank — compare vs Debian 'dmesg | grep -i dmub'"
+echo "           version; a match => GOP DMUB speaks mainline VBIOS dialect"
 echo "  Discovery,Source = 'on-die TMR' if ATY,bin_image was removed"
